@@ -27,14 +27,14 @@ export class SileroVAD extends EventEmitter {
           model: MODEL_PATH,
           threshold: 0.5,
           minSpeechDuration: 0.25,
-          minSilenceDuration: 0.4,
+          minSilenceDuration: 0.6, // longer pause tolerance for slow speakers
           windowSize: WINDOW_SIZE,
         },
         sampleRate: SAMPLE_RATE,
         debug: false,
         numThreads: 1,
       },
-      60
+      60,
     );
     this.buffer = new CircularBuffer(30 * SAMPLE_RATE);
   }

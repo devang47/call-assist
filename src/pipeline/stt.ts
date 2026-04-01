@@ -3,8 +3,9 @@ import { env } from "../config/env.js";
 
 const SAMPLE_RATE = 8000;
 const MIN_DURATION_S = 0.5;
+const STT_MAX_RETRIES = 2;
 const DENTAL_PROMPT =
-  "periodontal endodontic orthodontic prophylaxis scaling root canal crown veneer implant extraction filling cavity gingivitis fluoride bruxism malocclusion dental hygienist cleaning checkup appointment schedule";
+  "periodontal endodontic orthodontic prophylaxis scaling root canal crown veneer implant extraction filling cavity gingivitis fluoride bruxism malocclusion dental hygienist cleaning checkup appointment schedule chahiye appointment lena hai kab available hai booking cancel karna hai";
 
 /**
  * Groq Whisper batch STT.
@@ -38,16 +39,27 @@ export class GroqSTT {
     this.clearBuffer();
 
     const wavBuffer = createMulawWav(rawAudio, SAMPLE_RATE);
-    const file = new File([new Uint8Array(wavBuffer)], "audio.wav", { type: "audio/wav" });
 
-    const transcription = await this.groq.audio.transcriptions.create({
-      file,
-      model: env.GROQ_STT_MODEL,
-      language: "en",
-      prompt: DENTAL_PROMPT,
-    });
+    // Retry once on transient failure
+    for (let attempt = 0; attempt < STT_MAX_RETRIES; attempt++) {
+      try {
+        const file = new File([new Uint8Array(wavBuffer)], "audio.wav", { type: "audio/wav" });
+        const transcription = await this.groq.audio.transcriptions.create({
+          file,
+          model: env.GROQ_STT_MODEL,
+          prompt: DENTAL_PROMPT,
+        });
+        return transcription.text?.trim() || "";
+      } catch (err) {
+        if (attempt < STT_MAX_RETRIES - 1) {
+          await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+    }
 
-    return transcription.text?.trim() || "";
+    return "";
   }
 
   clearBuffer(): void {

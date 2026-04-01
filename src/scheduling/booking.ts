@@ -1,5 +1,5 @@
-import { calendar, getCalendarId } from "./google-calendar.js";
-import { env } from "../config/env.js";
+import { getCalendarClientForPractice } from "./google-calendar.js";
+import type { PracticeContext } from "../db/practice-context.js";
 
 interface BookingParams {
   date: string; // YYYY-MM-DD
@@ -19,10 +19,13 @@ interface BookingResult {
   service?: string;
 }
 
-export async function bookAppointment(params: BookingParams): Promise<BookingResult> {
+export async function bookAppointment(
+  params: BookingParams,
+  ctx: PracticeContext
+): Promise<BookingResult> {
   const { date, time, patientName, patientPhone, serviceType, notes } = params;
-  const duration = env.PRACTICE_APPOINTMENT_DURATION_MINUTES;
-  const tz = env.PRACTICE_TIMEZONE;
+  const duration = ctx.appointmentDurationMinutes;
+  const tz = ctx.timezone;
 
   const startDateTime = `${date}T${time}:00`;
   const endMinutes = timeToMinutes(time) + duration;
@@ -45,8 +48,10 @@ export async function bookAppointment(params: BookingParams): Promise<BookingRes
     .join("\n");
 
   try {
+    const calendar = await getCalendarClientForPractice(ctx.id);
+
     const event = await calendar.events.insert({
-      calendarId: getCalendarId(),
+      calendarId: ctx.googleCalendarId,
       requestBody: {
         summary,
         description,

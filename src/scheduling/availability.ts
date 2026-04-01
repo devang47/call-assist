@@ -1,63 +1,52 @@
-import { calendar, getCalendarId } from "./google-calendar.js";
-import { env } from "../config/env.js";
+import { getCalendarClientForPractice } from "./google-calendar.js";
+import type { PracticeContext } from "../db/practice-context.js";
 
 interface TimeSlot {
   start: string; // "09:00"
   end: string; // "09:30"
 }
 
-// Business hours by day of week (0 = Sunday)
-const BUSINESS_HOURS: Record<number, { open: string; close: string } | null> = {
-  0: null, // Sunday - closed
-  1: { open: "09:00", close: "17:00" },
-  2: { open: "09:00", close: "17:00" },
-  3: { open: "09:00", close: "17:00" },
-  4: { open: "09:00", close: "17:00" },
-  5: { open: "09:00", close: "17:00" },
-  6: { open: "09:00", close: "13:00" }, // Saturday half day
-};
-
 export async function checkAvailability(
   dateStr: string,
-  serviceType?: string
+  serviceType: string | undefined,
+  ctx: PracticeContext
 ): Promise<{ available: boolean; date: string; slots: TimeSlot[]; message: string }> {
   const date = new Date(dateStr + "T00:00:00");
   const dayOfWeek = date.getDay();
-  const hours = BUSINESS_HOURS[dayOfWeek];
+  const hours = ctx.businessHours[dayOfWeek];
 
   if (!hours) {
     return {
       available: false,
       date: dateStr,
       slots: [],
-      message: "The office is closed on this day. We are open Monday-Friday 9 AM to 5 PM and Saturday 9 AM to 1 PM.",
+      message: "The office is closed on this day.",
     };
   }
 
-  const duration = env.PRACTICE_APPOINTMENT_DURATION_MINUTES;
-  const tz = env.PRACTICE_TIMEZONE;
+  const duration = ctx.appointmentDurationMinutes;
+  const tz = ctx.timezone;
 
-  // Query Google Calendar for busy times on this date
   const timeMin = `${dateStr}T${hours.open}:00`;
   const timeMax = `${dateStr}T${hours.close}:00`;
 
   try {
+    const calendar = await getCalendarClientForPractice(ctx.id);
+
     const freeBusyResponse = await calendar.freebusy.query({
       requestBody: {
         timeMin: toISOWithTimezone(timeMin, tz),
         timeMax: toISOWithTimezone(timeMax, tz),
         timeZone: tz,
-        items: [{ id: getCalendarId() }],
+        items: [{ id: ctx.googleCalendarId }],
       },
     });
 
     const busySlots =
-      freeBusyResponse.data.calendars?.[getCalendarId()]?.busy || [];
+      freeBusyResponse.data.calendars?.[ctx.googleCalendarId]?.busy || [];
 
-    // Generate all possible slots within business hours
     const allSlots = generateTimeSlots(hours.open, hours.close, duration);
 
-    // Filter out slots that overlap with busy times
     const availableSlots = allSlots.filter((slot) => {
       const slotStart = new Date(`${dateStr}T${slot.start}:00`);
       const slotEnd = new Date(`${dateStr}T${slot.end}:00`);
@@ -123,10 +112,6 @@ function minutesToTime(minutes: number): string {
   return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`;
 }
 
-function toISOWithTimezone(localDateTime: string, timezone: string): string {
-  // Create a date in the specified timezone and return ISO string
-  const date = new Date(
-    new Date(localDateTime).toLocaleString("en-US", { timeZone: timezone })
-  );
+function toISOWithTimezone(localDateTime: string, _timezone: string): string {
   return new Date(localDateTime).toISOString();
 }
