@@ -4,9 +4,11 @@ import { z } from "zod";
 import type { FastifyBaseLogger } from "fastify";
 import { env } from "../config/env.js";
 import { getSystemPrompt } from "../voice/prompts.js";
-import { checkAvailability } from "../scheduling/availability.js";
+import { checkAvailability, type AvailabilityResult } from "../scheduling/availability.js";
 import { bookAppointment } from "../scheduling/booking.js";
 import type { PracticeContext } from "../db/practice-context.js";
+import { getCachedAvailability } from "./prefetch.js";
+import type { CallEventLogger } from "../lib/call-debug-log.js";
 
 const groq = createOpenAI({
   apiKey: env.GROQ_API_KEY,
@@ -20,51 +22,158 @@ export interface ToolCallbacks {
   /** Called before a tool executes — use to send "hold on" TTS messages */
   onToolStart: (toolName: string) => void;
   /** Called after a successful booking — use to send SMS confirmation */
-  onBookingComplete: (details: { date: string; time: string; patientName: string; service?: string }) => void;
+  onBookingComplete: (details: { date: string; time: string; patientName: string; patientPhone: string; service?: string }) => void;
 }
 
-function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: FastifyBaseLogger) {
+const INVALID_NAMES = new Set(["not provided", "unknown", "n/a", "caller", "patient", ""]);
+
+function hasUsablePhoneNumber(phone: string): boolean {
+  const digits = phone.replace(/\D/g, "");
+  return digits.length >= 7;
+}
+
+function createTools(
+  ctx: PracticeContext,
+  callbacks: ToolCallbacks,
+  log: FastifyBaseLogger,
+  eventLogger?: CallEventLogger
+) {
+  const availabilityCalls = new Map<string, number>();
+  const availabilityResults = new Map<string, AvailabilityResult>();
+  const availabilityInFlight = new Map<string, Promise<AvailabilityResult>>();
+
   return {
     check_availability: tool({
       description:
-        "Check available appointment slots for a given date. Returns a list of available time slots.",
+        "Check available appointment slots for a given date. If the caller mentioned an exact time like 12 p.m. or 14:00, include requested_time so the tool can confirm that exact time instead of forcing you to guess.",
       inputSchema: z.object({
         date: z.string().describe("The date to check availability for, in YYYY-MM-DD format"),
         service_type: z
           .string()
           .optional()
           .describe("Type of appointment: cleaning, checkup, filling, extraction, root_canal, crown, whitening, consultation, emergency"),
+        requested_time: z
+          .string()
+          .optional()
+          .describe("Exact time the caller asked about, like '12 p.m.', '2:30 pm', or '14:00'"),
       }),
-      execute: async ({ date, service_type }) => {
-        log.info({ tool: "check_availability", date, service_type }, "Tool called");
+      execute: async ({ date, service_type, requested_time }) => {
+        const requestKey = JSON.stringify({
+          date,
+          service_type: service_type ?? null,
+          requested_time: requested_time ?? null,
+        });
+        const repeatCount = (availabilityCalls.get(requestKey) ?? 0) + 1;
+        availabilityCalls.set(requestKey, repeatCount);
+
+        log.info({ tool: "check_availability", date, service_type, requested_time }, "Tool called");
+        eventLogger?.logEvent("tool_called", {
+          tool: "check_availability",
+          args: { date, service_type, requested_time },
+        });
+
         callbacks.onToolStart("check_availability");
-        const result = await checkAvailability(date, service_type, ctx);
+
+        const reuseExistingResult = async (): Promise<AvailabilityResult | null> => {
+          const cachedResult = availabilityResults.get(requestKey);
+          if (cachedResult) return cachedResult;
+
+          const inFlight = availabilityInFlight.get(requestKey);
+          if (!inFlight) return null;
+          return inFlight;
+        };
+
+        if (repeatCount > 1) {
+          const repeatedResult = await reuseExistingResult();
+          if (repeatedResult) {
+            const duplicateResult: AvailabilityResult & { duplicateRequest: boolean } = {
+              ...repeatedResult,
+              duplicateRequest: true,
+              message: `${repeatedResult.message} This exact availability was already checked in this turn. Use this result to answer the caller instead of calling the tool again.`,
+            };
+            log.warn({ tool: "check_availability", date, service_type, requested_time, repeatCount }, "Duplicate availability lookup in same turn");
+            eventLogger?.logEvent("tool_result", {
+              tool: "check_availability",
+              duplicateRequest: true,
+              result: duplicateResult,
+            });
+            return duplicateResult;
+          }
+        }
+
+        // Check speculative prefetch cache first
+        const cached = requested_time ? null : await getCachedAvailability(ctx.id, date);
+        if (cached) {
+          log.info({ tool: "check_availability", available: cached.available, slots: cached.slots.length, prefetched: true }, "Tool result (from prefetch cache)");
+          availabilityResults.set(requestKey, cached);
+          eventLogger?.logEvent("tool_result", {
+            tool: "check_availability",
+            prefetched: true,
+            result: cached,
+          });
+          return cached;
+        }
+
+        const promise = checkAvailability(date, service_type, ctx, requested_time);
+        availabilityInFlight.set(requestKey, promise);
+        let result: AvailabilityResult;
+        try {
+          result = await promise;
+        } finally {
+          availabilityInFlight.delete(requestKey);
+        }
+        availabilityResults.set(requestKey, result);
         log.info({ tool: "check_availability", available: result.available, slots: result.slots.length }, "Tool result");
+        eventLogger?.logEvent("tool_result", {
+          tool: "check_availability",
+          result,
+        });
         return result;
       },
     }),
 
     book_appointment: tool({
       description:
-        "Book an appointment slot for the caller. Use ONLY after the caller explicitly confirms the date, time, and says yes.",
+        "Book an appointment slot for the caller. Use ONLY after the caller explicitly confirms the service, date, time, callback phone number, and says yes.",
       inputSchema: z.object({
         date: z.string().describe("Appointment date in YYYY-MM-DD format"),
         time: z.string().describe("Appointment time in HH:MM 24-hour format (e.g., 14:00)"),
         patient_name: z.string().describe("Full name of the patient as they stated it"),
-        patient_phone: z.string().optional().describe("Phone number of the patient"),
+        patient_phone: z.string().describe("Callback phone number of the patient"),
         service_type: z.string().optional().describe("Type of dental service"),
         notes: z.string().optional().describe("Any additional notes about the appointment"),
       }),
       execute: async ({ date, time, patient_name, patient_phone, service_type, notes }) => {
         log.info({ tool: "book_appointment", date, time, patient_name, service_type }, "Tool called");
+        eventLogger?.logEvent("tool_called", {
+          tool: "book_appointment",
+          args: { date, time, patient_name, patient_phone, service_type, notes },
+        });
 
         // Reject if name is missing or placeholder
-        const invalidNames = ["not provided", "unknown", "n/a", "caller", "patient", ""];
-        if (invalidNames.includes(patient_name.toLowerCase().trim())) {
+        if (INVALID_NAMES.has(patient_name.toLowerCase().trim())) {
           log.warn({ patient_name }, "Booking rejected — invalid patient name");
+          eventLogger?.logEvent("tool_validation_failed", {
+            tool: "book_appointment",
+            patient_name,
+            reason: "invalid_patient_name",
+          });
           return {
             success: false,
             message: "You need to ask the caller for their name before booking.",
+          };
+        }
+
+        if (!hasUsablePhoneNumber(patient_phone)) {
+          log.warn({ patient_phone }, "Booking rejected — invalid patient phone");
+          eventLogger?.logEvent("tool_validation_failed", {
+            tool: "book_appointment",
+            patient_phone,
+            reason: "invalid_patient_phone",
+          });
+          return {
+            success: false,
+            message: "You need to ask the caller for their callback phone number before booking.",
           };
         }
 
@@ -81,6 +190,10 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
           ctx
         );
         log.info({ tool: "book_appointment", success: result.success, appointmentId: result.appointmentId }, "Tool result");
+        eventLogger?.logEvent("tool_result", {
+          tool: "book_appointment",
+          result,
+        });
         if (result.success) {
           callbacks.onOutcome("appointment_booked", {
             appointmentId: result.appointmentId,
@@ -90,6 +203,7 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
             date,
             time,
             patientName: patient_name,
+            patientPhone: patient_phone,
             service: service_type,
           });
         }
@@ -107,6 +221,10 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
       }),
       execute: async ({ query }) => {
         log.info({ tool: "get_practice_info", query }, "Tool called");
+        eventLogger?.logEvent("tool_called", {
+          tool: "get_practice_info",
+          args: { query },
+        });
         const DAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
         const hours: Record<string, string> = {};
         for (let d = 0; d < 7; d++) {
@@ -114,7 +232,7 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
           hours[DAY_NAMES[d]] = h ? `${h.open} - ${h.close}` : "Closed";
         }
         callbacks.onOutcome("info_provided");
-        return {
+        const result = {
           name: ctx.name,
           address: ctx.address || "Address not configured",
           phone: ctx.phone || ctx.twilioNumber,
@@ -127,6 +245,11 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
           ],
           appointment_duration_minutes: ctx.appointmentDurationMinutes,
         };
+        eventLogger?.logEvent("tool_result", {
+          tool: "get_practice_info",
+          result,
+        });
+        return result;
       },
     }),
 
@@ -138,8 +261,20 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
       }),
       execute: async ({ reason }) => {
         log.info({ tool: "transfer_to_human", reason }, "Tool called");
+        eventLogger?.logEvent("tool_called", {
+          tool: "transfer_to_human",
+          args: { reason },
+        });
         if (!ctx.staffPhone) {
           log.warn({ tool: "transfer_to_human" }, "No staff phone configured");
+          eventLogger?.logEvent("tool_result", {
+            tool: "transfer_to_human",
+            result: {
+              transfer: false,
+              message:
+                "No staff number is configured right now. Please take the caller's name and phone number so someone can call them back.",
+            },
+          });
           return {
             transfer: false,
             message:
@@ -147,7 +282,12 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
           };
         }
         callbacks.onTransfer(ctx.staffPhone, reason);
-        return { transfer: true, reason };
+        const result = { transfer: true, reason };
+        eventLogger?.logEvent("tool_result", {
+          tool: "transfer_to_human",
+          result,
+        });
+        return result;
       },
     }),
 
@@ -160,7 +300,16 @@ function createTools(ctx: PracticeContext, callbacks: ToolCallbacks, log: Fastif
       execute: async ({ reason }) => {
         log.info({ tool: "end_call", reason }, "Tool called");
         callbacks.onEndCall(reason);
-        return { hangup: true, reason };
+        const result = { hangup: true, reason };
+        eventLogger?.logEvent("tool_called", {
+          tool: "end_call",
+          args: { reason },
+        });
+        eventLogger?.logEvent("tool_result", {
+          tool: "end_call",
+          result,
+        });
+        return result;
       },
     }),
   };
@@ -177,7 +326,8 @@ export async function generateResponse(
   abortSignal: AbortSignal | undefined,
   ctx: PracticeContext,
   callbacks: ToolCallbacks,
-  log: FastifyBaseLogger
+  log: FastifyBaseLogger,
+  eventLogger?: CallEventLogger
 ): Promise<StreamingLLMResponse> {
   const abortController = new AbortController();
 
@@ -185,18 +335,23 @@ export async function generateResponse(
     abortSignal.addEventListener("abort", () => abortController.abort());
   }
 
-  const tools = createTools(ctx, callbacks, log);
+  const tools = createTools(ctx, callbacks, log, eventLogger);
 
   let hasToolError = false;
+  eventLogger?.logEvent("llm_request_started", {
+    model: env.GROQ_LLM_MODEL,
+    historyLength: conversationHistory.length,
+    maxSteps: env.GROQ_LLM_MAX_STEPS,
+  });
 
   const result = streamText({
     model: groq.chat(env.GROQ_LLM_MODEL),
     system: getSystemPrompt(ctx),
     messages: conversationHistory,
     tools,
-    stopWhen: stepCountIs(5),
-    temperature: 0.7,
-    maxOutputTokens: 150,
+    stopWhen: stepCountIs(env.GROQ_LLM_MAX_STEPS),
+    temperature: env.GROQ_LLM_TEMPERATURE,
+    maxOutputTokens: env.GROQ_LLM_MAX_OUTPUT_TOKENS,
     abortSignal: abortController.signal,
     onStepFinish: (event) => {
       if (event.finishReason === "error") {
@@ -217,6 +372,18 @@ export async function generateResponse(
         },
         "LLM step finished"
       );
+      eventLogger?.logEvent("llm_step_finished", {
+        stepText: event.text?.substring(0, 200) || "",
+        toolCalls: event.toolCalls?.map((tc: any) => ({
+          name: tc.toolName,
+          args: tc.args,
+        })),
+        toolResults: event.toolResults?.map((tr: any) => ({
+          name: tr.toolName,
+          result: tr.result,
+        })),
+        finishReason: event.finishReason,
+      });
     },
   });
 
@@ -231,12 +398,13 @@ export async function generateResponse(
     // If no text was produced and there was a tool error, retry without tools
     if (!hasContent && hasToolError) {
       log.warn("Tool use failed — retrying without tools");
+      eventLogger?.logEvent("llm_tool_retry_without_tools");
       const retryResult = streamText({
         model: groq.chat(env.GROQ_LLM_MODEL),
         system: getSystemPrompt(ctx),
         messages: conversationHistory,
-        temperature: 0.7,
-        maxOutputTokens: 150,
+        temperature: env.GROQ_LLM_TEMPERATURE,
+        maxOutputTokens: env.GROQ_LLM_MAX_OUTPUT_TOKENS,
         abortSignal: abortController.signal,
       });
       for await (const delta of retryResult.textStream) {

@@ -14,10 +14,13 @@ import { appendTranscriptTurn } from "../db/queries/transcripts.js";
 import { SileroVAD } from "../pipeline/vad.js";
 import { GroqSTT } from "../pipeline/stt.js";
 import { DeepgramTTS } from "../pipeline/tts.js";
+import { getCachedAudio } from "../pipeline/tts-cache.js";
 import { SentenceBuffer } from "../pipeline/sentence-buffer.js";
 import { generateResponse, type StreamingLLMResponse, type ToolCallbacks } from "../pipeline/llm.js";
 import { sendBookingConfirmationSms } from "../services/sms.js";
+import { maybePrefetchAvailability } from "../pipeline/prefetch.js";
 import type { PipelineState } from "../pipeline/types.js";
+import { createCallDebugLogger } from "../lib/call-debug-log.js";
 
 interface TwilioMessage {
   event: string;
@@ -31,9 +34,11 @@ interface TwilioMessage {
   mark?: { name: string };
 }
 
-const SILENCE_TIMEOUT_MS = 30_000;
 const MIN_TRANSCRIPT_WORDS = 2;
 const MIN_TRANSCRIPT_LENGTH = 4;
+const MULAW_SAMPLE_RATE = 8000;
+const PRE_SPEECH_BUFFER_MS = 200;
+const PRE_SPEECH_BUFFER_BYTES = Math.round((PRE_SPEECH_BUFFER_MS / 1000) * MULAW_SAMPLE_RATE);
 
 /**
  * Returns true if the transcript is too short or looks like noise/garbage.
@@ -46,7 +51,62 @@ function isGarbageTranscript(text: string): boolean {
   // Mostly non-ASCII / non-English noise (e.g. "Treże", "pasteur Treże")
   const asciiRatio = trimmed.replace(/[^\x20-\x7E]/g, "").length / trimmed.length;
   if (asciiRatio < 0.5) return true;
+  const normalizedWords = words
+    .map((word) => word.toLowerCase().replace(/[^a-z0-9+]/g, ""))
+    .filter(Boolean);
+  if (normalizedWords.length >= 4) {
+    let repeatedRun = 1;
+    for (let i = 1; i < normalizedWords.length; i++) {
+      if (normalizedWords[i] === normalizedWords[i - 1]) {
+        repeatedRun++;
+        if (repeatedRun >= 4) return true;
+      } else {
+        repeatedRun = 1;
+      }
+    }
+  }
+  if (normalizedWords.length >= 6) {
+    const counts = new Map<string, number>();
+    for (const word of normalizedWords) {
+      counts.set(word, (counts.get(word) || 0) + 1);
+    }
+    const highestWordFrequency = Math.max(...counts.values());
+    if (highestWordFrequency / normalizedWords.length >= 0.5) return true;
+  }
   return false;
+}
+
+function getErrorDetails(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: err.message,
+      stack: err.stack,
+    };
+  }
+  return { message: String(err) };
+}
+
+function sanitizeSpokenText(text: string): string {
+  const cleaned = text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^\(?checking availability\)?$/i.test(line))
+    .filter((line) => !/^(#+\s*)?step\s+\d+\s*:/i.test(line))
+    .filter((line) => !/^check availability\b/i.test(line))
+    .join(" ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/^#+\s*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleaned;
+}
+
+function looksLikeE164PhoneNumber(phone: string): boolean {
+  return /^\+[1-9]\d{6,14}$/.test(phone.trim());
 }
 
 /**
@@ -68,9 +128,21 @@ export function handleMediaStream(
 
   let turnStart: number | null = null;
   let ttsFirstByte: number | null = null;
+  let mediaFrameCount = 0;
+  let mediaBytes = 0;
+  let sessionClosed = false;
+  let capturingSpeech = false;
+  let preSpeechAudioChunks: Buffer[] = [];
+  let preSpeechAudioBytes = 0;
 
   const conversationHistory: ModelMessage[] = [];
   let currentResponse: StreamingLLMResponse | null = null;
+  let callDebugLogger: ReturnType<typeof createCallDebugLogger> | null = null;
+  const pendingCallEvents: Array<{
+    event: string;
+    data?: Record<string, unknown>;
+    timestamp: string;
+  }> = [];
 
   // LLM turn queue — prevents concurrent requests
   let llmBusy = false;
@@ -92,20 +164,109 @@ export function handleMediaStream(
   const vad = new SileroVAD();
   const stt = new GroqSTT();
   const tts = new DeepgramTTS();
-
   const twilioClient = Twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
 
+  function logCallEvent(
+    event: string,
+    data?: Record<string, unknown>,
+    timestamp = new Date().toISOString()
+  ) {
+    if (callDebugLogger) {
+      callDebugLogger.logEvent(event, data, timestamp);
+      return;
+    }
+    pendingCallEvents.push({ event, data, timestamp });
+  }
+
+  function clearPreSpeechBuffer() {
+    preSpeechAudioChunks = [];
+    preSpeechAudioBytes = 0;
+  }
+
+  function rememberPreSpeechAudio(chunk: Buffer) {
+    preSpeechAudioChunks.push(chunk);
+    preSpeechAudioBytes += chunk.length;
+
+    while (preSpeechAudioBytes > PRE_SPEECH_BUFFER_BYTES && preSpeechAudioChunks.length > 0) {
+      const evicted = preSpeechAudioChunks.shift();
+      preSpeechAudioBytes -= evicted?.length ?? 0;
+    }
+  }
+
+  function startSpeechCapture(includePreSpeech: boolean) {
+    stt.clearBuffer();
+    capturingSpeech = true;
+    if (includePreSpeech) {
+      for (const chunk of preSpeechAudioChunks) {
+        stt.appendAudio(chunk);
+      }
+    }
+    clearPreSpeechBuffer();
+  }
+
+  function resetSttCapture() {
+    capturingSpeech = false;
+    stt.clearBuffer();
+    clearPreSpeechBuffer();
+  }
+
+  function initCallDebugLogger() {
+    if (!callSid) return;
+
+    if (!callDebugLogger) {
+      callDebugLogger = createCallDebugLogger(
+        {
+          callSid,
+          callLogId,
+          callerPhone,
+          practiceId: ctx?.id,
+          practiceName: ctx?.name,
+          streamSid: streamSid || undefined,
+        },
+        log
+      );
+
+      for (const pendingEvent of pendingCallEvents) {
+        callDebugLogger.logEvent(pendingEvent.event, pendingEvent.data, pendingEvent.timestamp);
+      }
+      pendingCallEvents.length = 0;
+      return;
+    }
+
+    callDebugLogger.setContext({
+      callLogId,
+      callerPhone,
+      practiceId: ctx?.id,
+      practiceName: ctx?.name,
+      streamSid: streamSid || undefined,
+    });
+  }
+
   function logTranscript(role: string, content: string) {
+    const sequence = ++transcriptSeq;
+    logCallEvent("transcript_logged", {
+      role,
+      content,
+      sequence,
+      persistedToDatabase: Boolean(callLogId),
+    });
+
     if (!callLogId) return;
     try {
       appendTranscriptTurn({
         callLogId,
         role,
         content,
-        sequence: ++transcriptSeq,
+        sequence,
       });
     } catch (err) {
       log.error({ err }, "Failed to log transcript turn");
+      logCallEvent("transcript_persist_failed", {
+        role,
+        content,
+        sequence,
+        ...getErrorDetails(err),
+      });
     }
   }
 
@@ -115,143 +276,251 @@ export function handleMediaStream(
     book_appointment: "One moment while I book that.",
   };
   let holdMessageSent = false;
+  let pendingPlaybackMarks = 0;
+  let pendingPlaybackFlushes = 0;
+  let advanceOnPlaybackDrain = false;
+
+  function queueSpeech(text: string) {
+    if (sessionClosed) return;
+    if (!text.trim()) return;
+    logCallEvent("tts_text_queued", { text });
+    tts.sendText(text);
+    pendingPlaybackFlushes++;
+    tts.flush();
+  }
 
   const toolCallbacks: ToolCallbacks = {
     onOutcome: (outcome, details) => {
       callOutcome = outcome;
       if (details) callOutcomeDetails = { ...callOutcomeDetails, ...details };
+      logCallEvent("call_outcome_updated", {
+        outcome,
+        details,
+      });
     },
     onTransfer: (staffPhone, reason) => {
       pendingTransfer = { staffPhone, reason };
       callOutcome = "transferred";
       callOutcomeDetails = { ...callOutcomeDetails, transferReason: reason };
+      logCallEvent("transfer_requested", {
+        staffPhone,
+        reason,
+      });
     },
     onEndCall: (reason) => {
       pendingHangup = true;
       if (callOutcome === "abandoned") callOutcome = "completed";
       callOutcomeDetails = { ...callOutcomeDetails, endReason: reason };
+      logCallEvent("end_call_requested", { reason });
     },
     onToolStart: (toolName) => {
       const msg = TOOL_HOLD_MESSAGES[toolName];
+      logCallEvent("tool_execution_started", { toolName, holdMessage: msg || null });
       if (msg && !holdMessageSent) {
         holdMessageSent = true;
-        tts.sendText(msg);
-        tts.flush();
+        queueSpeech(msg);
       }
     },
     onBookingComplete: (details) => {
       // Send SMS confirmation after successful booking
-      if (callerPhone && ctx) {
-        sendBookingConfirmationSms(callerPhone, details, ctx, log);
+      logCallEvent("booking_completed", details);
+      const smsPhone = looksLikeE164PhoneNumber(details.patientPhone)
+        ? details.patientPhone
+        : callerPhone;
+
+      if (smsPhone && ctx) {
+        sendBookingConfirmationSms(smsPhone, details, ctx, log);
       }
     },
   };
 
+  function completePlaybackIfReady() {
+    if (sessionClosed) return;
+    if (!advanceOnPlaybackDrain || pendingPlaybackFlushes > 0 || pendingPlaybackMarks > 0) return;
+
+    advanceOnPlaybackDrain = false;
+
+    if (pendingTransfer) {
+      logCallEvent("playback_drain_transfer");
+      executeTransfer(pendingTransfer.staffPhone);
+      pendingTransfer = null;
+      return;
+    }
+
+    if (pendingHangup && !hangingUp) {
+      log.info("End-call tool triggered — hanging up");
+      logCallEvent("playback_drain_hangup");
+      hangupGracefully();
+      return;
+    }
+
+    state = "listening";
+    logCallEvent("state_changed", { state });
+    resetSilenceTimer();
+  }
+
   function resetSilenceTimer() {
+    if (sessionClosed) return;
     if (silenceTimer) clearTimeout(silenceTimer);
     silencePrompted = false;
     silenceTimer = setTimeout(() => {
       if (state === "listening") {
         if (!silencePrompted) {
           silencePrompted = true;
-          tts.sendText("Are you still there?");
-          tts.flush();
+          logCallEvent("silence_prompt_triggered", {
+            timeoutMs: env.SILENCE_TIMEOUT_MS,
+          });
+          queueSpeech("Are you still there?");
           state = "speaking";
+          logCallEvent("state_changed", { state });
+          advanceOnPlaybackDrain = true;
         } else {
           log.info("Silence timeout — hanging up");
+          logCallEvent("silence_timeout_hangup", {
+            timeoutMs: env.SILENCE_TIMEOUT_MS,
+          });
           hangupGracefully();
         }
       }
-    }, SILENCE_TIMEOUT_MS);
+    }, env.SILENCE_TIMEOUT_MS);
   }
 
   async function hangupGracefully() {
     if (hangingUp || !callSid) return;
     hangingUp = true;
+    logCallEvent("hangup_started", { callSid });
     try {
       await twilioClient.calls(callSid).update({ status: "completed" });
+      logCallEvent("hangup_completed", { callSid });
     } catch (err) {
       log.error({ err }, "Failed to hang up call via Twilio API");
+      logCallEvent("hangup_failed", getErrorDetails(err));
     }
   }
 
   async function executeTransfer(staffPhone: string) {
     if (!callSid) return;
+    logCallEvent("transfer_started", { staffPhone });
     try {
       const twiml = `<Response><Dial timeout="30">${staffPhone}</Dial><Say>I'm sorry, no one is available at the moment. Goodbye.</Say><Hangup/></Response>`;
       await twilioClient.calls(callSid).update({ twiml });
       log.info({ staffPhone }, "Call transferred to staff");
+      logCallEvent("transfer_completed", { staffPhone, twiml });
     } catch (err) {
       log.error({ err }, "Failed to transfer call");
+      logCallEvent("transfer_failed", {
+        staffPhone,
+        ...getErrorDetails(err),
+      });
     }
   }
 
   async function initPipeline() {
     if (!ctx) return;
     try {
-      const waitStart = performance.now();
-      await tts.start(); // No-op if already pre-warmed, otherwise waits for in-progress connection
-      log.info({ ttsReadyMs: (performance.now() - waitStart).toFixed(0) }, "Pipeline initialized");
+      const ttsWarmupStart = performance.now();
+      void tts.start()
+        .then(() => {
+          if (sessionClosed) return;
+          log.info({ ttsReadyMs: (performance.now() - ttsWarmupStart).toFixed(0) }, "TTS ready");
+          logCallEvent("tts_ready", {
+            ttsReadyMs: +(performance.now() - ttsWarmupStart).toFixed(0),
+          });
+        })
+        .catch((err) => {
+          if (sessionClosed) return;
+          log.error({ err }, "Failed to initialize TTS");
+          logCallEvent("pipeline_initialization_failed", getErrorDetails(err));
+        });
+
+      log.info("Pipeline initialized");
+      logCallEvent("pipeline_initialized", {
+        ttsWarmupStarted: true,
+      });
 
       // Personalized greeting for returning callers
-      let greeting: string;
+      const genericGreeting = `Thank you for calling ${ctx.name}. How can I help you today?`;
+      let greeting = genericGreeting;
       if (callerPhone && ctx.id !== "__env_fallback__") {
         try {
           const patient = getPatientByPhone(ctx.id, callerPhone);
           if (patient?.name && patient.callCount > 1) {
-            greeting = `Welcome back ${patient.name}! Thank you for calling ${ctx.name}. How can I help you today?`;
-          } else {
-            greeting = `Thank you for calling ${ctx.name}. How can I help you today?`;
+            const personalizedGreeting = `Welcome back ${patient.name}! Thank you for calling ${ctx.name}. How can I help you today?`;
+            greeting = getCachedAudio(personalizedGreeting) ? personalizedGreeting : genericGreeting;
           }
         } catch {
-          greeting = `Thank you for calling ${ctx.name}. How can I help you today?`;
+          greeting = genericGreeting;
         }
-      } else {
-        greeting = `Thank you for calling ${ctx.name}. How can I help you today?`;
       }
 
-      tts.sendText(greeting);
-      tts.flush();
+      queueSpeech(greeting);
       conversationHistory.push({ role: "assistant", content: greeting });
       logTranscript("assistant", greeting);
       state = "speaking";
+      logCallEvent("state_changed", { state });
+      advanceOnPlaybackDrain = true;
       log.info("Greeting sent");
     } catch (err) {
       log.error({ err }, "Failed to initialize pipeline");
+      logCallEvent("pipeline_initialization_failed", getErrorDetails(err));
     }
   }
 
   vad.on("speechStart", () => {
+    if (sessionClosed) return;
+    if (state !== "listening") return;
     if (silenceTimer) clearTimeout(silenceTimer);
-    if (state === "speaking") {
-      log.info("Interruption detected");
-      handleInterruption();
-    }
+    logCallEvent("speech_started", { state });
+    startSpeechCapture(true);
     state = "listening";
+    logCallEvent("state_changed", { state });
   });
 
   vad.on("speechEnd", async (durationSecs: number) => {
+    if (sessionClosed) return;
     turnStart = performance.now();
     ttsFirstByte = null;
+    capturingSpeech = false;
+    const bufferedAudioDurationS = stt.getBufferDuration();
+    clearPreSpeechBuffer();
 
-    if (stt.getBufferDuration() < 0.5) {
-      stt.clearBuffer();
+    logCallEvent("speech_ended", {
+      speechDurationS: +durationSecs.toFixed(1),
+      bufferedAudioDurationS: +bufferedAudioDurationS.toFixed(1),
+    });
+
+    if (bufferedAudioDurationS < 0.5) {
+      resetSttCapture();
       state = "listening";
+      logCallEvent("short_audio_discarded", {
+        audioDurationS: +bufferedAudioDurationS.toFixed(1),
+      });
+      logCallEvent("state_changed", { state });
       resetSilenceTimer();
       return;
     }
 
     state = "thinking";
+    logCallEvent("state_changed", { state });
     log.info({ speechDurationS: durationSecs.toFixed(1), audioDurationS: stt.getBufferDuration().toFixed(1) }, "Speech ended, transcribing");
 
     try {
       const sttStart = performance.now();
+      logCallEvent("stt_started", {
+        audioDurationS: +stt.getBufferDuration().toFixed(1),
+      });
       const transcript = await stt.transcribe();
       const sttMs = performance.now() - sttStart;
 
+      if (sessionClosed) {
+        return;
+      }
+
       if (!transcript) {
         log.info({ sttMs: +sttMs.toFixed(0) }, "Empty transcript");
+        logCallEvent("stt_empty", { sttMs: +sttMs.toFixed(0) });
         state = "listening";
+        logCallEvent("state_changed", { state });
         resetSilenceTimer();
         return;
       }
@@ -259,18 +528,39 @@ export function handleMediaStream(
       // Filter garbage transcripts
       if (isGarbageTranscript(transcript)) {
         log.info({ transcript, sttMs: +sttMs.toFixed(0) }, "Garbage transcript filtered");
+        logCallEvent("stt_garbage_filtered", {
+          transcript,
+          sttMs: +sttMs.toFixed(0),
+        });
         state = "listening";
+        logCallEvent("state_changed", { state });
         resetSilenceTimer();
         return;
       }
 
       log.info({ transcript, sttMs: +sttMs.toFixed(0) }, "STT complete");
+      logCallEvent("stt_completed", {
+        transcript,
+        sttMs: +sttMs.toFixed(0),
+      });
+
+      // Speculatively prefetch availability if transcript looks like a scheduling request
+      if (ctx) {
+        const prefetched = maybePrefetchAvailability(transcript, ctx);
+        if (prefetched) {
+          log.info("Speculative availability prefetch started");
+          logCallEvent("availability_prefetch_started", { transcript });
+        }
+      }
+
       enqueueLLMTurn(transcript);
     } catch (err) {
       log.error({ err }, "STT failed");
-      tts.sendText("I'm sorry, I didn't catch that. Could you please repeat?");
-      tts.flush();
+      logCallEvent("stt_failed", getErrorDetails(err));
+      queueSpeech("I'm sorry, I didn't catch that. Could you please repeat?");
       state = "speaking";
+      logCallEvent("state_changed", { state });
+      advanceOnPlaybackDrain = true;
     }
   });
 
@@ -279,6 +569,9 @@ export function handleMediaStream(
       ttsFirstByte = performance.now();
       const perceivedMs = ttsFirstByte - turnStart;
       log.info({ perceivedMs: +perceivedMs.toFixed(0) }, "First audio byte (perceived latency)");
+      logCallEvent("tts_first_audio_byte", {
+        perceivedMs: +perceivedMs.toFixed(0),
+      });
     }
 
     if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
@@ -293,7 +586,16 @@ export function handleMediaStream(
   });
 
   tts.on("flushed", () => {
+    logCallEvent("tts_flushed", {
+      pendingPlaybackFlushes,
+      pendingPlaybackMarks,
+    });
+    if (pendingPlaybackFlushes > 0) {
+      pendingPlaybackFlushes--;
+    }
+
     if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+      pendingPlaybackMarks++;
       const markName = `tts-done-${++markCounter}`;
       twilioWs.send(
         JSON.stringify({
@@ -302,19 +604,25 @@ export function handleMediaStream(
           mark: { name: markName },
         })
       );
+      return;
     }
+
+    completePlaybackIfReady();
   });
 
   tts.on("disconnected", () => {
     log.warn("TTS WebSocket disconnected — reconnecting");
+    logCallEvent("tts_disconnected");
   });
 
   tts.on("reconnected", (attempt: number) => {
     log.info({ attempt }, "TTS WebSocket reconnected");
+    logCallEvent("tts_reconnected", { attempt });
   });
 
   tts.on("error", (err: Error) => {
     log.error({ err }, "TTS error");
+    logCallEvent("tts_error", getErrorDetails(err));
   });
 
   twilioWs.on("message", (data) => {
@@ -323,8 +631,12 @@ export function handleMediaStream(
     switch (msg.event) {
       case "connected":
         log.info("Twilio stream connected");
+        logCallEvent("twilio_stream_connected");
         // Pre-warm TTS connection while Twilio's <Say> message plays
-        tts.start().catch((err) => log.error({ err }, "TTS pre-warm failed"));
+        tts.start().catch((err) => {
+          log.error({ err }, "TTS pre-warm failed");
+          logCallEvent("tts_prewarm_failed", getErrorDetails(err));
+        });
         break;
 
       case "start": {
@@ -337,11 +649,19 @@ export function handleMediaStream(
         callLogId = params.callLogId || undefined;
 
         ctx = loadPracticeById(practiceId) || getFallbackPracticeContext();
+        initCallDebugLogger();
 
         log.info(
           { streamSid, callSid, practiceId: ctx.id, practiceName: ctx.name, callerPhone },
           "Twilio stream started"
         );
+        logCallEvent("twilio_stream_started", {
+          streamSid,
+          practiceId: ctx.id,
+          practiceName: ctx.name,
+          callerPhone,
+          customParameters: params,
+        });
 
         initPipeline();
         break;
@@ -350,30 +670,37 @@ export function handleMediaStream(
       case "media":
         if (msg.media?.payload) {
           const audioBuffer = Buffer.from(msg.media.payload, "base64");
+          mediaFrameCount++;
+          mediaBytes += audioBuffer.length;
+          if (sessionClosed) break;
+          if (state !== "listening") {
+            resetSttCapture();
+            break;
+          }
           vad.processFrame(audioBuffer);
-          stt.appendAudio(audioBuffer);
+          if (capturingSpeech) {
+            stt.appendAudio(audioBuffer);
+          } else {
+            rememberPreSpeechAudio(audioBuffer);
+          }
         }
         break;
 
       case "mark":
-        if (msg.mark?.name.startsWith("tts-done-") && state === "speaking") {
-          if (pendingTransfer) {
-            executeTransfer(pendingTransfer.staffPhone);
-            pendingTransfer = null;
-            return;
+        if (msg.mark?.name.startsWith("tts-done-")) {
+          logCallEvent("twilio_mark_received", {
+            markName: msg.mark.name,
+          });
+          if (pendingPlaybackMarks > 0) {
+            pendingPlaybackMarks--;
           }
-          if (pendingHangup && !hangingUp) {
-            log.info("End-call tool triggered — hanging up");
-            hangupGracefully();
-            return;
-          }
-          state = "listening";
-          resetSilenceTimer();
+          completePlaybackIfReady();
         }
         break;
 
       case "stop":
         log.info("Call ended");
+        logCallEvent("twilio_stream_stopped");
         cleanup();
         break;
     }
@@ -381,26 +708,34 @@ export function handleMediaStream(
 
   twilioWs.on("close", () => {
     log.info("Twilio WebSocket closed");
+    logCallEvent("twilio_websocket_closed");
     cleanup();
   });
 
   twilioWs.on("error", (err) => {
     log.error({ err }, "Twilio WebSocket error");
+    logCallEvent("twilio_websocket_error", getErrorDetails(err));
   });
 
   /** Enqueue an LLM turn — if one is already running, queue it for after. */
   function enqueueLLMTurn(utterance: string) {
+    if (sessionClosed) return;
     if (llmBusy) {
       // Merge with pending utterance if one exists
       if (pendingUtterance) {
         pendingUtterance += " " + utterance;
         log.info({ merged: pendingUtterance }, "Merged queued utterance");
+        logCallEvent("llm_utterance_merged", {
+          mergedUtterance: pendingUtterance,
+        });
       } else {
         pendingUtterance = utterance;
         log.info("LLM busy — utterance queued");
+        logCallEvent("llm_utterance_queued", { utterance });
       }
       return;
     }
+    logCallEvent("llm_turn_started", { utterance });
     runLLMTurn(utterance);
   }
 
@@ -414,11 +749,13 @@ export function handleMediaStream(
       const next = pendingUtterance;
       pendingUtterance = null;
       log.info({ queued: next }, "Processing queued utterance");
+      logCallEvent("llm_queued_turn_processing", { utterance: next });
       runLLMTurn(next);
     }
   }
 
   async function processLLMTurn(userUtterance: string) {
+    if (sessionClosed) return;
     if (!userUtterance.trim() || !ctx) return;
 
     holdMessageSent = false;
@@ -433,47 +770,71 @@ export function handleMediaStream(
         abortController.signal,
         ctx,
         toolCallbacks,
-        log
+        log,
+        callDebugLogger ?? undefined
       );
+      if (sessionClosed) {
+        abortController.abort();
+        return;
+      }
       currentResponse = response;
+      logCallEvent("llm_generation_started", {
+        utterance: userUtterance,
+        historyLength: conversationHistory.length,
+      });
 
+      let firstSentenceTime: number | null = null;
       const sentenceBuffer = new SentenceBuffer((sentence) => {
-        tts.sendText(sentence);
+        const spokenSentence = sanitizeSpokenText(sentence);
+        if (!spokenSentence) return;
+        if (!firstSentenceTime) {
+          firstSentenceTime = performance.now() - llmStart;
+          log.info({ firstSentenceMs: +firstSentenceTime.toFixed(0) }, "LLM first sentence sent to TTS");
+          logCallEvent("llm_first_sentence", {
+            firstSentenceMs: +firstSentenceTime.toFixed(0),
+          });
+        }
+        queueSpeech(spokenSentence);
       });
 
       let fullResponse = "";
       let firstToken = true;
-      let firstSentenceTime: number | null = null;
 
       for await (const delta of response.textStream) {
         if (firstToken) {
           state = "speaking";
           const ttft = performance.now() - llmStart;
           log.info({ ttftMs: +ttft.toFixed(0) }, "LLM first token");
+          logCallEvent("state_changed", { state });
+          logCallEvent("llm_first_token", { ttftMs: +ttft.toFixed(0) });
           firstToken = false;
         }
         if (state !== "speaking") {
           log.info("LLM interrupted");
+          logCallEvent("llm_interrupted");
           break;
         }
         sentenceBuffer.add(delta);
         fullResponse += delta;
-
-        if (!firstSentenceTime && fullResponse.match(/[.!?]/)) {
-          firstSentenceTime = performance.now() - llmStart;
-          log.info({ firstSentenceMs: +firstSentenceTime.toFixed(0) }, "LLM first sentence sent to TTS");
-        }
       }
 
       sentenceBuffer.flush();
-      tts.flush();
 
       const llmTotalMs = performance.now() - llmStart;
       log.info({ llmTotalMs: +llmTotalMs.toFixed(0), responseLength: fullResponse.length, response: fullResponse }, "LLM complete");
+      logCallEvent("llm_completed", {
+        llmTotalMs: +llmTotalMs.toFixed(0),
+        responseLength: fullResponse.length,
+        response: fullResponse,
+      });
 
-      if (fullResponse) {
-        conversationHistory.push({ role: "assistant", content: fullResponse });
-        logTranscript("assistant", fullResponse);
+      const spokenResponse = sanitizeSpokenText(fullResponse);
+
+      if (spokenResponse) {
+        conversationHistory.push({ role: "assistant", content: spokenResponse });
+        logTranscript("assistant", spokenResponse);
+        advanceOnPlaybackDrain = true;
+        completePlaybackIfReady();
       } else {
         let fallback: string;
         if (pendingHangup) {
@@ -484,20 +845,32 @@ export function handleMediaStream(
           fallback = "I'm sorry, could you say that again?";
         }
         log.warn({ fallback, pendingHangup, callOutcome }, "LLM returned empty response — sending fallback");
-        tts.sendText(fallback);
-        tts.flush();
+        logCallEvent("llm_empty_response_fallback", {
+          fallback,
+          pendingHangup,
+          callOutcome,
+        });
+        queueSpeech(fallback);
         conversationHistory.push({ role: "assistant", content: fallback });
         logTranscript("assistant", fallback);
         state = "speaking";
+        logCallEvent("state_changed", { state });
+        advanceOnPlaybackDrain = true;
+        completePlaybackIfReady();
       }
 
       try {
         const finalText = await response.text;
-        if (finalText && finalText !== fullResponse) {
+        const reconciledText = sanitizeSpokenText(finalText);
+        if (reconciledText && reconciledText !== spokenResponse) {
           conversationHistory[conversationHistory.length - 1] = {
             role: "assistant",
-            content: finalText,
+            content: reconciledText,
           };
+          logCallEvent("llm_final_text_reconciled", {
+            previousResponse: spokenResponse,
+            finalText: reconciledText,
+          });
         }
       } catch {
         // Aborted
@@ -507,40 +880,40 @@ export function handleMediaStream(
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         log.info("LLM aborted");
+        logCallEvent("llm_aborted");
       } else {
         log.error({ err }, "LLM error");
-        tts.sendText("I'm sorry, I'm having trouble right now. Could you please try again?");
-        tts.flush();
+        logCallEvent("llm_error", getErrorDetails(err));
+        queueSpeech("I'm sorry, I'm having trouble right now. Could you please try again?");
         state = "speaking";
+        logCallEvent("state_changed", { state });
+        advanceOnPlaybackDrain = true;
+        completePlaybackIfReady();
       }
     }
   }
 
-  function handleInterruption() {
-    if (currentResponse) {
-      currentResponse.abort();
-      currentResponse = null;
-    }
-
-    if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
-    }
-
-    tts.clear();
-    pendingTransfer = null;
-    pendingHangup = false;
-    state = "listening";
-    log.info("Interruption handled");
-  }
-
   function cleanup() {
+    if (sessionClosed) return;
+    sessionClosed = true;
     if (silenceTimer) clearTimeout(silenceTimer);
     if (currentResponse) {
       currentResponse.abort();
       currentResponse = null;
+      logCallEvent("llm_abort_requested_for_cleanup");
     }
+    pendingPlaybackMarks = 0;
+    pendingPlaybackFlushes = 0;
+    advanceOnPlaybackDrain = false;
+    resetSttCapture();
+    vad.reset();
     vad.removeAllListeners();
     tts.close();
+    logCallEvent("media_stream_summary", {
+      mediaFrameCount,
+      mediaBytes,
+      turns: conversationHistory.length,
+    });
 
     if (callSid) {
       try {
@@ -549,8 +922,14 @@ export function handleMediaStream(
           outcome: callOutcome,
           outcomeDetails: callOutcomeDetails,
         });
+        logCallEvent("call_log_finalized", {
+          streamSid,
+          outcome: callOutcome,
+          outcomeDetails: callOutcomeDetails,
+        });
       } catch (err) {
         log.error({ err }, "Failed to finalize call log outcome");
+        logCallEvent("call_log_finalize_failed", getErrorDetails(err));
       }
     }
 
@@ -558,5 +937,11 @@ export function handleMediaStream(
       { turns: conversationHistory.length, callSid, outcome: callOutcome },
       "Session cleaned up"
     );
+    logCallEvent("session_cleaned_up", {
+      turns: conversationHistory.length,
+      callSid,
+      outcome: callOutcome,
+    });
+    callDebugLogger?.close();
   }
 }

@@ -15,6 +15,7 @@ export class DeepgramTTS extends EventEmitter {
   private ws: WebSocket | null = null;
   private isOpen = false;
   private pendingText: string[] = [];
+  private pendingFlushes = 0;
   private reconnecting = false;
 
   // Cache collection: track chunks per text being synthesized
@@ -35,7 +36,7 @@ export class DeepgramTTS extends EventEmitter {
 
   private connect(): Promise<void> {
     const params = new URLSearchParams({
-      model: "aura-2-thalia-en",
+      model: env.DEEPGRAM_TTS_MODEL,
       encoding: "mulaw",
       sample_rate: "8000",
     });
@@ -54,6 +55,11 @@ export class DeepgramTTS extends EventEmitter {
           this.sendText(text);
         }
         this.pendingText = [];
+
+        while (this.pendingFlushes > 0 && this.ws && this.isOpen) {
+          this.ws.send(JSON.stringify({ type: "Flush" }));
+          this.pendingFlushes--;
+        }
 
         resolve();
       });
@@ -170,7 +176,9 @@ export class DeepgramTTS extends EventEmitter {
     }
     if (this.ws && this.isOpen) {
       this.ws.send(JSON.stringify({ type: "Flush" }));
+      return;
     }
+    this.pendingFlushes++;
   }
 
   clear(): void {
@@ -178,6 +186,7 @@ export class DeepgramTTS extends EventEmitter {
       this.ws.send(JSON.stringify({ type: "Clear" }));
     }
     this.pendingText = [];
+    this.pendingFlushes = 0;
     this.currentSynthText = null;
     this.currentChunks = [];
   }
@@ -191,5 +200,6 @@ export class DeepgramTTS extends EventEmitter {
       this.ws.close();
       this.ws = null;
     }
+    this.pendingFlushes = 0;
   }
 }

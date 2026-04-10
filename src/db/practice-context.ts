@@ -60,6 +60,15 @@ export function loadPracticeById(id: string): PracticeContext | null {
   return rowToContext(row);
 }
 
+export function loadActivePractices(): PracticeContext[] {
+  return db
+    .select()
+    .from(practices)
+    .all()
+    .filter((row) => row.active)
+    .map(rowToContext);
+}
+
 /** Fallback PracticeContext from env vars (for backward compatibility) */
 export function getFallbackPracticeContext(): PracticeContext {
   return {

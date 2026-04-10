@@ -70,6 +70,7 @@ curl -sL -o models/silero_vad.onnx \
 2. Create OAuth 2.0 credentials (Web application)
 3. Add `{SERVER_URL}/api/auth/google/callback` as a redirect URI
 4. Start the server and visit `/api/auth/google` to connect your calendar
+5. If you have multiple practices, use `/api/practices/{practiceId}/auth/google` instead
 
 ### Twilio
 

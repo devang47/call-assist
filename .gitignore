@@ -7,3 +7,4 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 storage/tts-cache/
+storage/call-logs/

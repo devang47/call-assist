@@ -42,9 +42,10 @@ Twilio inbound call
 Per-frame audio loop:
   Twilio mulaw audio → Silero VAD (local) → speech boundaries
   → Groq Whisper batch STT (with garbage filter: min 2 words, 4 chars)
+  → Speculative prefetch (if scheduling keywords detected, fire check_availability in parallel)
   → LLM turn queue (prevents concurrent requests)
-  → Groq LLM streaming with tools (check_availability, book_appointment, etc.)
-  → Sentence buffer → Deepgram TTS → Twilio playback
+  → Groq LLM streaming with tools (check_availability uses prefetch cache if available)
+  → Clause-level sentence buffer → Deepgram TTS → Twilio playback
 ```
 
 ### Key Design Patterns
@@ -56,6 +57,8 @@ Per-frame audio loop:
 - **TTS audio cache**: SHA-256 hash of text → mulaw chunks on disk (`storage/tts-cache/`). Greetings and common phrases served without API calls after first synthesis.
 - **Tool hold messages**: "Let me check that for you" / "One moment while I book that" sent via TTS before tool execution so caller isn't left in silence.
 - **Contextual fallbacks**: When LLM returns empty text (tool calls consumed all steps), the system sends a contextual message based on call state (goodbye, booking confirmation, or retry prompt).
+- **Speculative prefetch**: After STT, if transcript contains scheduling keywords ("appointment", "tomorrow", etc.), `check_availability` fires in parallel with the LLM call. Date is extracted from natural language. The tool checks a 30s TTL cache before hitting the Calendar API — saves 500-1500ms when the LLM does request availability.
+- **Clause-level sentence buffer**: Flushes TTS on clause boundaries (commas, semicolons, conjunctions like "and"/"but"), not just sentence-ending punctuation. Gets audio playing ~200ms earlier.
 
 ### Database (SQLite + Drizzle)
 

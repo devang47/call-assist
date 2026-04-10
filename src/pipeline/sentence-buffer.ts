@@ -1,43 +1,69 @@
 /**
- * Buffers streaming LLM tokens into sentence-level chunks.
- * This enables TTS to start speaking before the LLM finishes generating,
- * reducing perceived latency by overlapping LLM generation with TTS synthesis.
+ * Buffers streaming LLM tokens into speakable chunks for TTS.
+ *
+ * Aggressively flushes at natural speech boundaries to minimize
+ * time-to-first-audio. Priority order:
+ * 1. Sentence enders: . ! ?
+ * 2. Clause separators: , ; : —
+ * 3. Subordinate clause starters: "that", "which", "because", "so", "and", "but"
+ * 4. Length-based fallback: flush at 80 chars regardless
  */
 export class SentenceBuffer {
   private buffer = "";
   private onSentence: (sentence: string) => void;
 
-  // Sentence-ending punctuation that triggers a flush to TTS
-  private static SENTENCE_ENDERS = /[.!?]/;
-  // Also flush on commas if the buffer is long enough (natural pause points)
-  private static CLAUSE_ENDER = /,/;
-  private static MIN_CLAUSE_LENGTH = 40;
+  private static SENTENCE_ENDERS = /[.!?]$/;
+  private static CLAUSE_SEPARATORS = /[,;:\u2014-]$/; // comma, semicolon, colon, em-dash, hyphen
+  private static MIN_CLAUSE_LENGTH = 20; // flush on clause separator if buffer >= this
+  private static MAX_BUFFER_LENGTH = 80; // force flush regardless
+  // Words that start a new clause — flush BEFORE them if buffer is long enough
+  private static CLAUSE_STARTERS = /\s(that|which|because|since|so|and|but|or|if|when|where|while|although|however|also)\s/i;
+  private static MIN_CLAUSE_STARTER_LENGTH = 25;
 
   constructor(onSentence: (sentence: string) => void) {
     this.onSentence = onSentence;
   }
 
-  /** Add a token/chunk from the LLM stream */
   add(text: string): void {
     this.buffer += text;
 
-    // Check for sentence-ending punctuation
-    if (SentenceBuffer.SENTENCE_ENDERS.test(text)) {
+    // 1. Sentence-ending punctuation — always flush
+    if (SentenceBuffer.SENTENCE_ENDERS.test(this.buffer.trim())) {
       this.flush();
       return;
     }
 
-    // Check for clause-ending comma with sufficient length
+    // 2. Clause separator with enough content
     if (
-      SentenceBuffer.CLAUSE_ENDER.test(text) &&
-      this.buffer.trim().length >= SentenceBuffer.MIN_CLAUSE_LENGTH
+      this.buffer.trim().length >= SentenceBuffer.MIN_CLAUSE_LENGTH &&
+      SentenceBuffer.CLAUSE_SEPARATORS.test(this.buffer.trim())
     ) {
+      this.flush();
+      return;
+    }
+
+    // 3. Clause-starting conjunction mid-buffer — split before it
+    if (this.buffer.trim().length >= SentenceBuffer.MIN_CLAUSE_STARTER_LENGTH) {
+      const match = SentenceBuffer.CLAUSE_STARTERS.exec(this.buffer);
+      if (match && match.index >= SentenceBuffer.MIN_CLAUSE_LENGTH) {
+        // Flush everything before the conjunction
+        const before = this.buffer.substring(0, match.index + 1); // include the space
+        const after = this.buffer.substring(match.index + 1);
+        this.buffer = "";
+        const trimmed = before.trim();
+        if (trimmed) this.onSentence(trimmed);
+        this.buffer = after;
+        return;
+      }
+    }
+
+    // 4. Length-based fallback — force flush on long buffers
+    if (this.buffer.trim().length >= SentenceBuffer.MAX_BUFFER_LENGTH) {
       this.flush();
       return;
     }
   }
 
-  /** Force flush whatever is in the buffer (called when LLM finishes) */
   flush(): void {
     const text = this.buffer.trim();
     if (text) {
@@ -46,12 +72,10 @@ export class SentenceBuffer {
     }
   }
 
-  /** Clear the buffer without sending (for interruptions) */
   clear(): void {
     this.buffer = "";
   }
 
-  /** Check if the buffer has any pending content */
   hasPending(): boolean {
     return this.buffer.trim().length > 0;
   }

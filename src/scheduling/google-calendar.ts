@@ -6,6 +6,7 @@ import { db } from "../db/index.js";
 import { googleOauthTokens } from "../db/schema.js";
 
 const SCOPES = ["https://www.googleapis.com/auth/calendar"];
+const OAUTH_CALLBACK_PATH = "/api/auth/google/callback";
 
 // Cache per-practice calendar clients
 const clientCache = new Map<
@@ -24,7 +25,7 @@ export async function getCalendarClientForPractice(
   const oauth2Client = new google.auth.OAuth2(
     env.GOOGLE_CLIENT_ID,
     env.GOOGLE_CLIENT_SECRET,
-    `${env.SERVER_URL}/api/practices/${practiceId}/auth/google/callback`
+    `${env.SERVER_URL}${OAUTH_CALLBACK_PATH}`
   );
 
   // Try loading tokens from DB
@@ -71,7 +72,7 @@ export function getAuthUrl(practiceId: string): string {
   const oauth2Client = new google.auth.OAuth2(
     env.GOOGLE_CLIENT_ID,
     env.GOOGLE_CLIENT_SECRET,
-    `${env.SERVER_URL}/api/practices/${practiceId}/auth/google/callback`
+    `${env.SERVER_URL}${OAUTH_CALLBACK_PATH}`
   );
 
   return oauth2Client.generateAuthUrl({
@@ -90,7 +91,7 @@ export async function exchangeAndStoreTokens(
   const oauth2Client = new google.auth.OAuth2(
     env.GOOGLE_CLIENT_ID,
     env.GOOGLE_CLIENT_SECRET,
-    `${env.SERVER_URL}/api/practices/${practiceId}/auth/google/callback`
+    `${env.SERVER_URL}${OAUTH_CALLBACK_PATH}`
   );
 
   const { tokens } = await oauth2Client.getToken(code);

@@ -6,8 +6,8 @@ import type { PracticeContext } from "../db/practice-context.js";
 const twilioClient = Twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
 
 export function sendBookingConfirmationSms(
-  callerPhone: string,
-  details: { date: string; time: string; patientName: string; service?: string },
+  recipientPhone: string,
+  details: { date: string; time: string; patientName: string; patientPhone: string; service?: string },
   ctx: PracticeContext,
   log: FastifyBaseLogger
 ) {
@@ -29,12 +29,12 @@ export function sendBookingConfirmationSms(
     .create({
       body,
       from: ctx.twilioNumber,
-      to: callerPhone,
+      to: recipientPhone,
     })
     .then(() => {
-      log.info({ to: callerPhone }, "SMS booking confirmation sent");
+      log.info({ to: recipientPhone }, "SMS booking confirmation sent");
     })
     .catch((err) => {
-      log.error({ err, to: callerPhone }, "Failed to send SMS booking confirmation");
+      log.error({ err, to: recipientPhone }, "Failed to send SMS booking confirmation");
     });
 }

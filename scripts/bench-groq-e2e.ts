@@ -8,7 +8,11 @@ import WebSocket from "ws";
 import { readFileSync } from "fs";
 import path from "path";
 
-const groq = new Groq({ apiKey: process.env.GROK_API_KEY });
+const groqKey = process.env.GROQ_API_KEY || process.env.GROK_API_KEY;
+if (!groqKey) {
+  throw new Error("Missing GROQ_API_KEY");
+}
+const groq = new Groq({ apiKey: groqKey });
 const DG_KEY = process.env.DEEPGRAM_API_KEY!;
 const INPUT_FILE = path.resolve(process.cwd(), "input.mp3");
 

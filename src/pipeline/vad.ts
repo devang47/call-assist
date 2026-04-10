@@ -4,6 +4,7 @@ const { Vad, CircularBuffer } = sherpa;
 import alawmulaw from "alawmulaw";
 const { mulaw } = alawmulaw;
 import path from "path";
+import { env } from "../config/env.js";
 
 const MODEL_PATH = path.resolve(process.cwd(), "models", "silero_vad.onnx");
 const SAMPLE_RATE = 16000;
@@ -25,9 +26,9 @@ export class SileroVAD extends EventEmitter {
       {
         sileroVad: {
           model: MODEL_PATH,
-          threshold: 0.5,
-          minSpeechDuration: 0.25,
-          minSilenceDuration: 0.6, // longer pause tolerance for slow speakers
+          threshold: env.VAD_THRESHOLD,
+          minSpeechDuration: env.VAD_MIN_SPEECH_DURATION_S,
+          minSilenceDuration: env.VAD_MIN_SILENCE_DURATION_S,
           windowSize: WINDOW_SIZE,
         },
         sampleRate: SAMPLE_RATE,

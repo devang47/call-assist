@@ -9,6 +9,7 @@ const envSchema = z.object({
 
   // Database
   DATABASE_PATH: z.string().default("./data/call-assist.db"),
+  CALL_LOG_DIR: z.string().default("./storage/call-logs"),
 
   // Twilio
   TWILIO_ACCOUNT_SID: z.string().min(1),
@@ -21,11 +22,22 @@ const envSchema = z.object({
 
   // Deepgram (TTS)
   DEEPGRAM_API_KEY: z.string().min(1),
+  DEEPGRAM_TTS_MODEL: z.string().default("aura-2-thalia-en"),
 
   // Groq (STT + LLM)
   GROQ_API_KEY: z.string().min(1),
   GROQ_STT_MODEL: z.string().default("whisper-large-v3-turbo"),
   GROQ_LLM_MODEL: z.string().default("llama-3.3-70b-versatile"),
+  GROQ_LLM_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
+  GROQ_LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(80),
+  GROQ_LLM_MAX_STEPS: z.coerce.number().int().min(2).max(8).default(4),
+
+  // Voice tuning
+  SILENCE_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  VAD_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
+  VAD_MIN_SPEECH_DURATION_S: z.coerce.number().positive().default(0.2),
+  VAD_MIN_SILENCE_DURATION_S: z.coerce.number().positive().default(0.65),
+  AVAILABILITY_RESULT_LIMIT: z.coerce.number().int().positive().default(6),
 
   // Google Calendar (shared OAuth app credentials)
   GOOGLE_CLIENT_ID: z.string().min(1),

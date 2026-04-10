@@ -7,6 +7,7 @@ import {
 import { createCallLog, updateCallLog } from "../../db/queries/call-logs.js";
 import { findOrCreatePatient } from "../../db/queries/patients.js";
 import { validateTwilioSignature } from "../../middleware/twilio-signature.js";
+import { createCallDebugLogger } from "../../lib/call-debug-log.js";
 
 export async function twilioRoutes(app: FastifyInstance) {
   // Validate Twilio webhook signatures on POST routes
@@ -23,6 +24,24 @@ export async function twilioRoutes(app: FastifyInstance) {
 
     // Look up practice by Twilio number, fall back to env config
     const ctx = loadPracticeByTwilioNumber(toNumber) || getFallbackPracticeContext();
+    const callDebug = callSid
+      ? createCallDebugLogger(
+          {
+            callSid,
+            callerPhone,
+            practiceId: ctx.id,
+            practiceName: ctx.name,
+          },
+          app.log
+        )
+      : null;
+
+    callDebug?.logEvent("incoming_call_received", {
+      toNumber,
+      callerPhone,
+      webhookBody: body,
+      usedFallbackPractice: ctx.id === "__env_fallback__",
+    });
 
     // Create patient record and call log
     let patientId: string | undefined;
@@ -39,8 +58,19 @@ export async function twilioRoutes(app: FastifyInstance) {
           patientId,
         });
       }
+      if (callLogId) {
+        callDebug?.setContext({ callLogId });
+      }
+      callDebug?.logEvent("call_record_initialized", {
+        patientId,
+        callLogId,
+        practiceId: ctx.id,
+      });
     } catch (err) {
       app.log.error({ err }, "Failed to create call log / patient record");
+      callDebug?.logEvent("call_record_initialization_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     // Use <Parameter> elements — they arrive in the WebSocket start event
@@ -56,6 +86,11 @@ export async function twilioRoutes(app: FastifyInstance) {
     </Stream>
   </Connect>
 </Response>`;
+
+    callDebug?.logEvent("incoming_call_twiml_sent", {
+      twiml,
+      websocketPath: "/twilio/media-stream",
+    });
 
     reply.type("text/xml").send(twiml);
   });
@@ -74,8 +109,22 @@ export async function twilioRoutes(app: FastifyInstance) {
     const status = body.CallStatus;
     const duration = body.CallDuration;
     const price = body.Price;
+    const callDebug = callSid
+      ? createCallDebugLogger(
+          {
+            callSid,
+          },
+          app.log
+        )
+      : null;
 
     app.log.info({ callSid, status, duration, price }, "Call status update");
+    callDebug?.logEvent("call_status_received", {
+      status,
+      duration,
+      price,
+      webhookBody: body,
+    });
 
     if (callSid && (status === "completed" || status === "failed" || status === "no-answer")) {
       try {
@@ -84,8 +133,18 @@ export async function twilioRoutes(app: FastifyInstance) {
           durationSeconds: duration ? parseInt(duration, 10) : undefined,
           costCents: price ? Math.round(Math.abs(parseFloat(price)) * 100) : undefined,
         });
+        callDebug?.logEvent("call_status_persisted", {
+          status,
+          endedAt: true,
+          durationSeconds: duration ? parseInt(duration, 10) : undefined,
+          costCents: price ? Math.round(Math.abs(parseFloat(price)) * 100) : undefined,
+        });
       } catch (err) {
         app.log.error({ err }, "Failed to update call log on status change");
+        callDebug?.logEvent("call_status_persist_failed", {
+          error: err instanceof Error ? err.message : String(err),
+          status,
+        });
       }
     }
 
