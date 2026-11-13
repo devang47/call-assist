@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import path from "path";
+import { env } from "../config/env.js";
 
 const CACHE_DIR = path.resolve(process.cwd(), "storage", "tts-cache");
 
@@ -9,8 +10,11 @@ if (!existsSync(CACHE_DIR)) {
   mkdirSync(CACHE_DIR, { recursive: true });
 }
 
+// Keyed by voice model too, so changing DEEPGRAM_TTS_MODEL never replays the old voice.
 function hashText(text: string): string {
-  return createHash("sha256").update(text.trim().toLowerCase()).digest("hex");
+  return createHash("sha256")
+    .update(`${env.DEEPGRAM_TTS_MODEL}\n${text.trim().toLowerCase()}`)
+    .digest("hex");
 }
 
 function cachePath(hash: string): string {

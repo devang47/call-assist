@@ -1,5 +1,6 @@
 import { getCalendarClientForPractice } from "./google-calendar.js";
 import type { PracticeContext } from "../db/practice-context.js";
+import { localDateTimeToIso } from "../lib/time.js";
 
 interface BookingParams {
   date: string; // YYYY-MM-DD
@@ -49,6 +50,25 @@ export async function bookAppointment(
 
   try {
     const calendar = await getCalendarClientForPractice(ctx.id);
+
+    // Re-check right before inserting: the slot may have been taken since the
+    // caller heard it offered (another caller, staff, or a stale prefetch).
+    // ponytail: check-then-insert still has a small race window; a per-practice lock fixes it if volume grows.
+    const freeBusy = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: localDateTimeToIso(date, time, tz),
+        timeMax: localDateTimeToIso(date, endTime, tz),
+        timeZone: tz,
+        items: [{ id: ctx.googleCalendarId }],
+      },
+    });
+    const busy = freeBusy.data.calendars?.[ctx.googleCalendarId]?.busy ?? [];
+    if (busy.length > 0) {
+      return {
+        success: false,
+        message: `The ${time} slot on ${date} was just taken. Apologize, then call check_availability again and offer the caller a different time.`,
+      };
+    }
 
     const event = await calendar.events.insert({
       calendarId: ctx.googleCalendarId,

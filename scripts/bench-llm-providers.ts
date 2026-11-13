@@ -81,6 +81,7 @@ async function* groqChunks(model: string, messages: { role: "system" | "assistan
     model,
     messages,
     max_tokens: 120,
+    reasoning_effort: model.startsWith("qwen/") ? "none" : "low",
     temperature: 0.3,
     stream: true,
   });
@@ -281,9 +282,9 @@ async function main() {
   console.log("=== LLM Provider Benchmark ===\n");
 
   const results = [
-    ...(await runProvider("Groq", "meta-llama/llama-4-scout-17b-16e-instruct", (messages) => groqChunks("meta-llama/llama-4-scout-17b-16e-instruct", messages))),
-    ...(await runProvider("Groq", "llama-3.1-8b-instant", (messages) => groqChunks("llama-3.1-8b-instant", messages))),
-    ...(await runProvider("Groq", "llama-3.3-70b-versatile", (messages) => groqChunks("llama-3.3-70b-versatile", messages))),
+    ...(await runProvider("Groq", "qwen/qwen3.8-27b", (messages) => groqChunks("qwen/qwen3.8-27b", messages))),
+    ...(await runProvider("Groq", "openai/gpt-oss-120b", (messages) => groqChunks("openai/gpt-oss-120b", messages))),
+    ...(await runProvider("Groq", "openai/gpt-oss-20b", (messages) => groqChunks("openai/gpt-oss-20b", messages))),
     ...(await runProvider("MiMo", "mimo-v2-flash", (messages) => mimoChunks("mimo-v2-flash", messages))),
     ...(await runProvider("MiMo", "mimo-v2-pro", (messages) => mimoChunks("mimo-v2-pro", messages))),
     ...(await runProvider("OpenAI", "gpt-4o-mini", (messages) => openAIChunks("gpt-4o-mini", messages))),

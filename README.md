@@ -12,7 +12,7 @@ Phone Call → Twilio → Silero VAD → Groq Whisper STT → Groq LLM → Deepg
 2. Twilio streams audio to the server via WebSocket
 3. **Silero VAD** (local) detects when the caller starts/stops speaking
 4. **Groq Whisper** transcribes the buffered audio in ~315ms
-5. **Groq Llama-4-Scout** generates a response with ~113ms TTFT, streaming through a sentence buffer
+5. **Groq Qwen 3.8 27B** (reasoning off) generates a response, streaming through a sentence buffer
 6. **Deepgram TTS** converts each sentence to speech as it arrives
 7. Audio streams back to the caller via Twilio
 
@@ -125,14 +125,10 @@ models/
 Run latency benchmarks against individual services:
 
 ```bash
-# Groq STT + LLM end-to-end
-npx tsx scripts/bench-groq.ts
-
-# Full round-trip with real audio
-npx tsx scripts/bench-roundtrip.ts
-
-# Compare multiple LLM models
-npx tsx scripts/bench-models.ts
+pnpm bench:stt:providers   # STT providers
+pnpm bench:llm:providers   # LLM providers (TTFT, first sentence)
+pnpm bench:tts:providers   # TTS providers (time to first byte)
+pnpm bench:e2e             # Round trip with real audio (input.mp3)
 ```
 
 ## Tech Stack
@@ -141,7 +137,7 @@ npx tsx scripts/bench-models.ts
 |-----------|---------|---------|
 | VAD | Silero VAD (local) | ~30ms |
 | STT | Groq Whisper Large V3 Turbo | ~315ms |
-| LLM | Groq Llama-4-Scout | ~113ms TTFT |
+| LLM | Groq Qwen 3.8 27B | not yet measured (`pnpm bench:llm:providers`) |
 | TTS | Deepgram Aura-2 | ~400ms first byte |
 | Telephony | Twilio Media Streams | - |
 | Scheduling | Google Calendar API | - |

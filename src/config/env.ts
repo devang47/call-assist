@@ -27,7 +27,9 @@ const envSchema = z.object({
   // Groq (STT + LLM)
   GROQ_API_KEY: z.string().min(1),
   GROQ_STT_MODEL: z.string().default("whisper-large-v3-turbo"),
-  GROQ_LLM_MODEL: z.string().default("llama-3.3-70b-versatile"),
+  GROQ_LLM_MODEL: z.string().default("qwen/qwen3.8-27b"),
+  // "none" = Qwen instruct mode. gpt-oss needs "low". Empty string = don't send it.
+  GROQ_LLM_REASONING_EFFORT: z.enum(["", "none", "low", "medium", "high"]).default("none"),
   GROQ_LLM_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
   GROQ_LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(80),
   GROQ_LLM_MAX_STEPS: z.coerce.number().int().min(2).max(8).default(4),
@@ -37,6 +39,11 @@ const envSchema = z.object({
   VAD_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
   VAD_MIN_SPEECH_DURATION_S: z.coerce.number().positive().default(0.2),
   VAD_MIN_SILENCE_DURATION_S: z.coerce.number().positive().default(0.65),
+  // Let the caller interrupt the assistant. Turn off if line noise causes false interrupts.
+  BARGE_IN_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
   AVAILABILITY_RESULT_LIMIT: z.coerce.number().int().positive().default(6),
 
   // Google Calendar (shared OAuth app credentials)

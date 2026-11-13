@@ -1,6 +1,6 @@
 import type { PracticeContext } from "../db/practice-context.js";
 import { checkAvailability } from "../scheduling/availability.js";
-import { nextWeekdayInTimeZone, offsetDateInTimeZone } from "../lib/time.js";
+import { getCurrentDateInTimeZone, nextWeekdayInTimeZone, offsetDateInTimeZone } from "../lib/time.js";
 
 /**
  * Speculative prefetch for check_availability.
@@ -29,10 +29,26 @@ const MONTH_MAP: Record<string, number> = {
 };
 
 /**
+ * Next occurrence of month/day on or after today in the practice's timezone
+ * ("5 jan" said in December means next year). Null for dates like "31 feb".
+ */
+function upcomingDate(month: number, day: number, timeZone: string): string | null {
+  const today = getCurrentDateInTimeZone(timeZone);
+  const year = Number(today.slice(0, 4));
+  for (const y of [year, year + 1]) {
+    const d = new Date(Date.UTC(y, month, day));
+    if (d.getUTCMonth() !== month) return null;
+    const iso = d.toISOString().slice(0, 10);
+    if (iso >= today) return iso;
+  }
+  return null;
+}
+
+/**
  * Try to extract a YYYY-MM-DD date from the transcript.
  * Returns null if no date can be inferred.
  */
-function extractDate(transcript: string, timeZone: string): string | null {
+export function extractDate(transcript: string, timeZone: string): string | null {
   // Relative dates
   if (/\btomorrow\b/i.test(transcript)) return offsetDateInTimeZone(timeZone, 1);
   if (/\btoday\b/i.test(transcript)) return offsetDateInTimeZone(timeZone, 0);
@@ -50,21 +66,13 @@ function extractDate(transcript: string, timeZone: string): string | null {
   if (dmy) {
     const day = parseInt(dmy[1]);
     const month = MONTH_MAP[dmy[2].toLowerCase().substring(0, 3)];
-    if (month !== undefined) {
-      const year = new Date().getFullYear();
-      const d = new Date(year, month, day);
-      return d.toISOString().split("T")[0];
-    }
+    if (month !== undefined) return upcomingDate(month, day, timeZone);
   }
   const mdy = transcript.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2})(?:st|nd|rd|th)?\b/i);
   if (mdy) {
     const month = MONTH_MAP[mdy[1].toLowerCase().substring(0, 3)];
     const day = parseInt(mdy[2]);
-    if (month !== undefined) {
-      const year = new Date().getFullYear();
-      const d = new Date(year, month, day);
-      return d.toISOString().split("T")[0];
-    }
+    if (month !== undefined) return upcomingDate(month, day, timeZone);
   }
 
   return null;
@@ -103,11 +111,17 @@ export function maybePrefetchAvailability(
   // Auto-cleanup after TTL
   promise.then((cached) => {
     setTimeout(() => {
-      prefetchCache.delete(key);
+      // Only if it wasn't invalidated and replaced by a newer prefetch meanwhile
+      if (prefetchCache.get(key) === promise) prefetchCache.delete(key);
     }, CACHE_TTL_MS);
   });
 
   return true;
+}
+
+/** Drop a cached result once a booking changes that day's calendar. */
+export function invalidatePrefetch(practiceId: string, date: string): void {
+  prefetchCache.delete(cacheKey(practiceId, date));
 }
 
 /**

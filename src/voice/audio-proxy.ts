@@ -14,7 +14,6 @@ import { appendTranscriptTurn } from "../db/queries/transcripts.js";
 import { SileroVAD } from "../pipeline/vad.js";
 import { GroqSTT } from "../pipeline/stt.js";
 import { DeepgramTTS } from "../pipeline/tts.js";
-import { getCachedAudio } from "../pipeline/tts-cache.js";
 import { SentenceBuffer } from "../pipeline/sentence-buffer.js";
 import { generateResponse, type StreamingLLMResponse, type ToolCallbacks } from "../pipeline/llm.js";
 import { sendBookingConfirmationSms } from "../services/sms.js";
@@ -276,17 +275,43 @@ export function handleMediaStream(
     book_appointment: "One moment while I book that.",
   };
   let holdMessageSent = false;
-  let pendingPlaybackMarks = 0;
+  /** Twilio marks sent but not yet played back. A Set so marks returned after a clear are ignored. */
+  const pendingMarks = new Set<string>();
   let pendingPlaybackFlushes = 0;
   let advanceOnPlaybackDrain = false;
+  /** Bumped on every barge-in so the running LLM turn knows it was cut off. */
+  let speechEpoch = 0;
 
-  function queueSpeech(text: string) {
+  /** `cache` only for fixed phrases — LLM output can contain names and phone numbers. */
+  function queueSpeech(text: string, cache = false) {
     if (sessionClosed) return;
     if (!text.trim()) return;
-    logCallEvent("tts_text_queued", { text });
-    tts.sendText(text);
+    logCallEvent("tts_text_queued", { text, cache });
     pendingPlaybackFlushes++;
-    tts.flush();
+    tts.speak(text, { cache });
+  }
+
+  /** Caller started talking over the assistant: stop playback and listen. */
+  function interrupt() {
+    speechEpoch++;
+    log.info("Caller barged in — stopping playback");
+    logCallEvent("barge_in", {
+      pendingPlaybackFlushes,
+      pendingMarks: pendingMarks.size,
+      pendingHangup,
+    });
+    if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+    }
+    tts.clear();
+    currentResponse?.abort();
+    pendingPlaybackFlushes = 0;
+    pendingMarks.clear();
+    advanceOnPlaybackDrain = false;
+    // They have more to say, so don't hang up after the cut-off goodbye.
+    pendingHangup = false;
+    state = "listening";
+    logCallEvent("state_changed", { state });
   }
 
   const toolCallbacks: ToolCallbacks = {
@@ -318,7 +343,13 @@ export function handleMediaStream(
       logCallEvent("tool_execution_started", { toolName, holdMessage: msg || null });
       if (msg && !holdMessageSent) {
         holdMessageSent = true;
-        queueSpeech(msg);
+        queueSpeech(msg, true);
+      }
+      // No barge-in while a tool runs: aborting mid-booking would book the slot
+      // without ever confirming it to the caller.
+      if (state === "speaking") {
+        state = "thinking";
+        logCallEvent("state_changed", { state });
       }
     },
     onBookingComplete: (details) => {
@@ -336,7 +367,7 @@ export function handleMediaStream(
 
   function completePlaybackIfReady() {
     if (sessionClosed) return;
-    if (!advanceOnPlaybackDrain || pendingPlaybackFlushes > 0 || pendingPlaybackMarks > 0) return;
+    if (!advanceOnPlaybackDrain || pendingPlaybackFlushes > 0 || pendingMarks.size > 0) return;
 
     advanceOnPlaybackDrain = false;
 
@@ -370,7 +401,7 @@ export function handleMediaStream(
           logCallEvent("silence_prompt_triggered", {
             timeoutMs: env.SILENCE_TIMEOUT_MS,
           });
-          queueSpeech("Are you still there?");
+          queueSpeech("Are you still there?", true);
           state = "speaking";
           logCallEvent("state_changed", { state });
           advanceOnPlaybackDrain = true;
@@ -445,15 +476,16 @@ export function handleMediaStream(
         try {
           const patient = getPatientByPhone(ctx.id, callerPhone);
           if (patient?.name && patient.callCount > 1) {
-            const personalizedGreeting = `Welcome back ${patient.name}! Thank you for calling ${ctx.name}. How can I help you today?`;
-            greeting = getCachedAudio(personalizedGreeting) ? personalizedGreeting : genericGreeting;
+            greeting = `Welcome back ${patient.name}! Thank you for calling ${ctx.name}. How can I help you today?`;
           }
         } catch {
           greeting = genericGreeting;
         }
       }
 
-      queueSpeech(greeting);
+      // Generic greeting comes from the disk cache after the first call; the
+      // personalized one contains a name, so it's synthesized each time.
+      queueSpeech(greeting, greeting === genericGreeting);
       conversationHistory.push({ role: "assistant", content: greeting });
       logTranscript("assistant", greeting);
       state = "speaking";
@@ -468,6 +500,7 @@ export function handleMediaStream(
 
   vad.on("speechStart", () => {
     if (sessionClosed) return;
+    if (state === "speaking") interrupt();
     if (state !== "listening") return;
     if (silenceTimer) clearTimeout(silenceTimer);
     logCallEvent("speech_started", { state });
@@ -557,7 +590,7 @@ export function handleMediaStream(
     } catch (err) {
       log.error({ err }, "STT failed");
       logCallEvent("stt_failed", getErrorDetails(err));
-      queueSpeech("I'm sorry, I didn't catch that. Could you please repeat?");
+      queueSpeech("I'm sorry, I didn't catch that. Could you please repeat?", true);
       state = "speaking";
       logCallEvent("state_changed", { state });
       advanceOnPlaybackDrain = true;
@@ -588,15 +621,15 @@ export function handleMediaStream(
   tts.on("flushed", () => {
     logCallEvent("tts_flushed", {
       pendingPlaybackFlushes,
-      pendingPlaybackMarks,
+      pendingMarks: pendingMarks.size,
     });
     if (pendingPlaybackFlushes > 0) {
       pendingPlaybackFlushes--;
     }
 
     if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-      pendingPlaybackMarks++;
       const markName = `tts-done-${++markCounter}`;
+      pendingMarks.add(markName);
       twilioWs.send(
         JSON.stringify({
           event: "mark",
@@ -632,7 +665,7 @@ export function handleMediaStream(
       case "connected":
         log.info("Twilio stream connected");
         logCallEvent("twilio_stream_connected");
-        // Pre-warm TTS connection while Twilio's <Say> message plays
+        // Open the TTS socket before the start event arrives
         tts.start().catch((err) => {
           log.error({ err }, "TTS pre-warm failed");
           logCallEvent("tts_prewarm_failed", getErrorDetails(err));
@@ -673,7 +706,9 @@ export function handleMediaStream(
           mediaFrameCount++;
           mediaBytes += audioBuffer.length;
           if (sessionClosed) break;
-          if (state !== "listening") {
+          // While speaking, keep listening so the caller can interrupt.
+          const canHear = state === "listening" || (state === "speaking" && env.BARGE_IN_ENABLED);
+          if (!canHear) {
             resetSttCapture();
             break;
           }
@@ -691,9 +726,7 @@ export function handleMediaStream(
           logCallEvent("twilio_mark_received", {
             markName: msg.mark.name,
           });
-          if (pendingPlaybackMarks > 0) {
-            pendingPlaybackMarks--;
-          }
+          pendingMarks.delete(msg.mark.name);
           completePlaybackIfReady();
         }
         break;
@@ -799,23 +832,42 @@ export function handleMediaStream(
 
       let fullResponse = "";
       let firstToken = true;
+      const epoch = speechEpoch;
+      const wasInterrupted = () => epoch !== speechEpoch;
 
-      for await (const delta of response.textStream) {
-        if (firstToken) {
-          state = "speaking";
-          const ttft = performance.now() - llmStart;
-          log.info({ ttftMs: +ttft.toFixed(0) }, "LLM first token");
-          logCallEvent("state_changed", { state });
-          logCallEvent("llm_first_token", { ttftMs: +ttft.toFixed(0) });
-          firstToken = false;
+      try {
+        for await (const delta of response.textStream) {
+          if (wasInterrupted()) break;
+          if (firstToken) {
+            const ttft = performance.now() - llmStart;
+            log.info({ ttftMs: +ttft.toFixed(0) }, "LLM first token");
+            logCallEvent("llm_first_token", { ttftMs: +ttft.toFixed(0) });
+            firstToken = false;
+          }
+          // Also re-entered after a tool call put us back in "thinking".
+          if (state !== "speaking") {
+            state = "speaking";
+            logCallEvent("state_changed", { state });
+          }
+          sentenceBuffer.add(delta);
+          fullResponse += delta;
         }
-        if (state !== "speaking") {
-          log.info("LLM interrupted");
-          logCallEvent("llm_interrupted");
-          break;
+      } catch (err) {
+        if (!wasInterrupted()) throw err; // aborting the stream on barge-in may throw
+      }
+
+      if (wasInterrupted()) {
+        // Keep what was generated so the model knows where it got cut off.
+        // Tool results from this turn are lost with the aborted stream.
+        const partial = sanitizeSpokenText(fullResponse);
+        log.info({ partial }, "LLM interrupted by caller");
+        logCallEvent("llm_interrupted", { partialResponse: partial });
+        if (partial) {
+          conversationHistory.push({ role: "assistant", content: partial });
+          logTranscript("assistant", partial);
         }
-        sentenceBuffer.add(delta);
-        fullResponse += delta;
+        currentResponse = null;
+        return;
       }
 
       sentenceBuffer.flush();
@@ -830,8 +882,21 @@ export function handleMediaStream(
 
       const spokenResponse = sanitizeSpokenText(fullResponse);
 
+      // Assistant tool calls + tool results, so later turns still know which
+      // slots were offered instead of re-checking or inventing them.
+      let responseMessages: ModelMessage[] = [];
+      try {
+        responseMessages = await response.responseMessages();
+      } catch (err) {
+        logCallEvent("llm_response_messages_failed", getErrorDetails(err));
+      }
+
       if (spokenResponse) {
-        conversationHistory.push({ role: "assistant", content: spokenResponse });
+        if (responseMessages.length > 0) {
+          conversationHistory.push(...responseMessages);
+        } else {
+          conversationHistory.push({ role: "assistant", content: spokenResponse });
+        }
         logTranscript("assistant", spokenResponse);
         advanceOnPlaybackDrain = true;
         completePlaybackIfReady();
@@ -850,30 +915,13 @@ export function handleMediaStream(
           pendingHangup,
           callOutcome,
         });
-        queueSpeech(fallback);
-        conversationHistory.push({ role: "assistant", content: fallback });
+        queueSpeech(fallback, true);
+        conversationHistory.push(...responseMessages, { role: "assistant", content: fallback });
         logTranscript("assistant", fallback);
         state = "speaking";
         logCallEvent("state_changed", { state });
         advanceOnPlaybackDrain = true;
         completePlaybackIfReady();
-      }
-
-      try {
-        const finalText = await response.text;
-        const reconciledText = sanitizeSpokenText(finalText);
-        if (reconciledText && reconciledText !== spokenResponse) {
-          conversationHistory[conversationHistory.length - 1] = {
-            role: "assistant",
-            content: reconciledText,
-          };
-          logCallEvent("llm_final_text_reconciled", {
-            previousResponse: spokenResponse,
-            finalText: reconciledText,
-          });
-        }
-      } catch {
-        // Aborted
       }
 
       currentResponse = null;
@@ -884,7 +932,7 @@ export function handleMediaStream(
       } else {
         log.error({ err }, "LLM error");
         logCallEvent("llm_error", getErrorDetails(err));
-        queueSpeech("I'm sorry, I'm having trouble right now. Could you please try again?");
+        queueSpeech("I'm sorry, I'm having trouble right now. Could you please try again?", true);
         state = "speaking";
         logCallEvent("state_changed", { state });
         advanceOnPlaybackDrain = true;
@@ -902,7 +950,7 @@ export function handleMediaStream(
       currentResponse = null;
       logCallEvent("llm_abort_requested_for_cleanup");
     }
-    pendingPlaybackMarks = 0;
+    pendingMarks.clear();
     pendingPlaybackFlushes = 0;
     advanceOnPlaybackDrain = false;
     resetSttCapture();

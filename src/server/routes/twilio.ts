@@ -75,9 +75,9 @@ export async function twilioRoutes(app: FastifyInstance) {
 
     // Use <Parameter> elements — they arrive in the WebSocket start event
     // as customParameters. This is more reliable than query params.
+    // No <Say> first: the assistant's own (cached) greeting plays as soon as the stream starts.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Please wait while we connect you to our assistant.</Say>
   <Connect>
     <Stream url="wss://${request.headers.host}/twilio/media-stream">
       <Parameter name="practiceId" value="${ctx.id}" />

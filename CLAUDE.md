@@ -8,7 +8,7 @@ AI-powered phone receptionist for dental offices. Handles inbound calls via Twil
 - **Telephony**: Twilio (Media Streams WebSocket + REST API + SMS)
 - **VAD**: Silero VAD via sherpa-onnx-node (local, mulaw 8kHz → float32 16kHz)
 - **STT**: Groq Whisper (`whisper-large-v3-turbo`, batch API, auto language detect)
-- **LLM**: Groq `llama-3.3-70b-versatile` (streaming via Vercel AI SDK `@ai-sdk/openai` with Groq base URL)
+- **LLM**: Groq `qwen/qwen3.8-27b` with `reasoning_effort: "none"` (streaming via Vercel AI SDK `@ai-sdk/openai` with Groq base URL)
 - **TTS**: Deepgram Aura-2 (streaming WebSocket, mulaw 8kHz output)
 - **Tool calling**: Vercel AI SDK (`ai` + `@ai-sdk/openai`) with Zod schemas, `stopWhen: stepCountIs(5)`
 - **Database**: SQLite (better-sqlite3) + Drizzle ORM
@@ -34,7 +34,7 @@ pnpm db:studio    # Drizzle Kit studio (DB browser)
 ```
 Twilio inbound call
   → POST /twilio/incoming-call (practice lookup by To number, create call log + patient)
-  → TwiML <Say> + <Stream> with <Parameter> elements
+  → TwiML <Stream> with <Parameter> elements (no <Say>; our cached greeting plays first)
   → WebSocket /twilio/media-stream
   → start event: read customParameters (practiceId, callerPhone, callLogId)
   → Load PracticeContext, pre-warm TTS, send greeting
@@ -53,11 +53,13 @@ Per-frame audio loop:
 - **PracticeContext**: Interface threaded through entire pipeline. Loaded from DB by Twilio number, falls back to env vars. All practice-specific config (name, hours, timezone, calendar, staff phone) comes from this, not env.
 - **Twilio `<Parameter>` elements**: Custom metadata passed via TwiML `<Stream><Parameter>` tags, received in the WebSocket `start` event's `customParameters`. More reliable than URL query params.
 - **LLM turn queue**: `enqueueLLMTurn()` → `runLLMTurn()`. If LLM is busy, new transcripts are merged and queued. Prevents stale-context concurrent requests.
-- **State machine**: `idle → listening → thinking → speaking`. Interruptions only allowed in `speaking` state. Tool execution happens in `thinking` — VAD events during this phase don't abort the response.
-- **TTS audio cache**: SHA-256 hash of text → mulaw chunks on disk (`storage/tts-cache/`). Greetings and common phrases served without API calls after first synthesis.
+- **State machine**: `idle → listening → thinking → speaking`. Interruptions only allowed in `speaking` state. Tool execution happens in `thinking` (`onToolStart` drops back to it) — VAD events during this phase don't abort the response.
+- **Barge-in**: VAD keeps running while `speaking` (`BARGE_IN_ENABLED`). On speech start, `interrupt()` sends Twilio `clear`, calls `tts.clear()`, aborts the LLM, and bumps `speechEpoch` so the running turn stops and saves only its partial text.
+- **Conversation history**: After each turn, the AI SDK response messages (assistant tool calls + tool results) are appended, not just the spoken text, so the model remembers offered slots.
+- **TTS queue + audio cache**: `tts.speak(text, { cache })` queues one utterance; audio is emitted in queue order even when an utterance comes from disk. Only fixed phrases (`cache: true`: greeting, hold messages, fallbacks) are cached, keyed by SHA-256 of model + text in `storage/tts-cache/`. LLM output is never cached (it can contain names/phone numbers).
 - **Tool hold messages**: "Let me check that for you" / "One moment while I book that" sent via TTS before tool execution so caller isn't left in silence.
 - **Contextual fallbacks**: When LLM returns empty text (tool calls consumed all steps), the system sends a contextual message based on call state (goodbye, booking confirmation, or retry prompt).
-- **Speculative prefetch**: After STT, if transcript contains scheduling keywords ("appointment", "tomorrow", etc.), `check_availability` fires in parallel with the LLM call. Date is extracted from natural language. The tool checks a 30s TTL cache before hitting the Calendar API — saves 500-1500ms when the LLM does request availability.
+- **Speculative prefetch**: After STT, if transcript contains scheduling keywords ("appointment", "tomorrow", etc.), `check_availability` fires in parallel with the LLM call. Date is extracted from natural language. The tool checks a 30s TTL cache before hitting the Calendar API — saves 500-1500ms when the LLM does request availability. Booking attempts invalidate that day's cache, and `book_appointment` re-checks FreeBusy before inserting.
 - **Clause-level sentence buffer**: Flushes TTS on clause boundaries (commas, semicolons, conjunctions like "and"/"but"), not just sentence-ending punctuation. Gets audio playing ~200ms earlier.
 
 ### Database (SQLite + Drizzle)
@@ -133,7 +135,8 @@ src/
 scripts/
   seed.ts                    # Seed a practice + Google OAuth token from .env
   debug-call.ts              # Fetch Twilio call logs + error notifications
-  bench-*.ts                 # Latency benchmarks (STT, LLM, TTS, round-trip)
+  bench-*-providers.ts       # Per-stage provider benchmarks (STT, LLM, TTS)
+  bench-groq-e2e.ts          # Round trip: real audio → STT → LLM → TTS (pnpm bench:e2e)
 drizzle/                     # Generated migrations
 storage/tts-cache/           # Cached TTS audio (gitignored)
 data/                        # SQLite DB file (gitignored)
@@ -146,7 +149,7 @@ See `.env.example`. Key ones:
 - `DATABASE_PATH` — SQLite file path (default `./data/call-assist.db`)
 - `TWILIO_SIGNATURE_VALIDATION` — `true`/`false` (set `false` for local dev)
 - `NODE_ENV` — `development` (pino-pretty) or `production` (JSON logs)
-- `GROQ_LLM_MODEL` — default `llama-3.3-70b-versatile`
+- `GROQ_LLM_MODEL` — default `qwen/qwen3.8-27b`; `GROQ_LLM_REASONING_EFFORT` — default `none` (use `low` for gpt-oss)
 - Practice config env vars are fallbacks — DB is the primary source
 
 ## Important Gotchas
@@ -154,6 +157,8 @@ See `.env.example`. Key ones:
 - TwiML is XML — any `&` in URLs must be `&amp;`. Use `<Parameter>` elements instead of query params for WebSocket metadata.
 - Twilio Media Stream WebSocket connections don't carry `X-Twilio-Signature` — signature validation middleware skips GET requests.
 - `streamText` from Vercel AI SDK defaults to `stepCountIs(1)` which means tool results aren't sent back to the model. Must set `stopWhen: stepCountIs(N)` where N >= 2.
-- Groq's `openai/gpt-oss-20b` does NOT work with tool calling via the OpenAI-compatible endpoint. Use `llama-3.3-70b-versatile`.
+- `llama-3.3-70b-versatile` was retired by Groq for non-enterprise accounts (Aug 2026).
+- Qwen 3.x reasons by default — keep `GROQ_LLM_REASONING_EFFORT=none` or TTFT balloons. Groq rejects `reasoning_format: raw` with tools.
+- Tests: `pnpm test` (vitest, `src/**/*.test.ts`).
 - State must be `"thinking"` (not `"speaking"`) during tool execution to prevent VAD interruptions from aborting the response before text arrives.
 - `better-sqlite3` requires native build — run `pnpm rebuild better-sqlite3` if bindings are missing.

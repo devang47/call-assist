@@ -13,6 +13,7 @@
     "bench:stt:providers": "tsx scripts/bench-stt-providers.ts",
     "bench:llm:providers": "tsx scripts/bench-llm-providers.ts",
     "bench:tts:providers": "tsx scripts/bench-tts-providers.ts",
+    "bench:e2e": "tsx scripts/bench-groq-e2e.ts",
     "tunnel": "cloudflared tunnel run sticky",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",

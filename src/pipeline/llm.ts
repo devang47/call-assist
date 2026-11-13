@@ -7,7 +7,7 @@ import { getSystemPrompt } from "../voice/prompts.js";
 import { checkAvailability, type AvailabilityResult } from "../scheduling/availability.js";
 import { bookAppointment } from "../scheduling/booking.js";
 import type { PracticeContext } from "../db/practice-context.js";
-import { getCachedAvailability } from "./prefetch.js";
+import { getCachedAvailability, invalidatePrefetch } from "./prefetch.js";
 import type { CallEventLogger } from "../lib/call-debug-log.js";
 
 const groq = createOpenAI({
@@ -194,6 +194,8 @@ function createTools(
           tool: "book_appointment",
           result,
         });
+        // Booked or slot just taken: either way the cached availability for this day is stale.
+        invalidatePrefetch(ctx.id, date);
         if (result.success) {
           callbacks.onOutcome("appointment_booked", {
             appointmentId: result.appointmentId,
@@ -317,9 +319,19 @@ function createTools(
 
 export interface StreamingLLMResponse {
   textStream: AsyncIterable<string>;
-  text: PromiseLike<string>;
+  /**
+   * Assistant + tool messages from every step, for the conversation history.
+   * Call after textStream is fully consumed (it covers the no-tools retry too).
+   */
+  responseMessages: () => Promise<ModelMessage[]>;
   abort: () => void;
 }
+
+// Qwen 3.x thinks by default; a voice turn can't afford that. Set
+// GROQ_LLM_REASONING_EFFORT=low for gpt-oss models, which don't accept "none".
+const providerOptions = env.GROQ_LLM_REASONING_EFFORT
+  ? { openai: { reasoningEffort: env.GROQ_LLM_REASONING_EFFORT } }
+  : undefined;
 
 export async function generateResponse(
   conversationHistory: ModelMessage[],
@@ -353,6 +365,7 @@ export async function generateResponse(
     temperature: env.GROQ_LLM_TEMPERATURE,
     maxOutputTokens: env.GROQ_LLM_MAX_OUTPUT_TOKENS,
     abortSignal: abortController.signal,
+    providerOptions,
     onStepFinish: (event) => {
       if (event.finishReason === "error") {
         hasToolError = true;
@@ -360,13 +373,13 @@ export async function generateResponse(
       log.info(
         {
           stepText: event.text?.substring(0, 200) || "(empty)",
-          toolCalls: event.toolCalls?.map((tc: any) => ({
+          toolCalls: event.toolCalls?.map((tc) => ({
             name: tc.toolName,
-            args: tc.args,
+            args: tc.input,
           })),
-          toolResults: event.toolResults?.map((tr: any) => ({
+          toolResults: event.toolResults?.map((tr) => ({
             name: tr.toolName,
-            result: JSON.stringify(tr.result).substring(0, 200),
+            result: JSON.stringify(tr.output).substring(0, 200),
           })),
           finishReason: event.finishReason,
         },
@@ -374,13 +387,13 @@ export async function generateResponse(
       );
       eventLogger?.logEvent("llm_step_finished", {
         stepText: event.text?.substring(0, 200) || "",
-        toolCalls: event.toolCalls?.map((tc: any) => ({
+        toolCalls: event.toolCalls?.map((tc) => ({
           name: tc.toolName,
-          args: tc.args,
+          args: tc.input,
         })),
-        toolResults: event.toolResults?.map((tr: any) => ({
+        toolResults: event.toolResults?.map((tr) => ({
           name: tr.toolName,
-          result: tr.result,
+          result: tr.output,
         })),
         finishReason: event.finishReason,
       });
@@ -388,6 +401,7 @@ export async function generateResponse(
   });
 
   // If a tool_use_failed error occurs, retry once without tools
+  let finalResult: { response: PromiseLike<{ messages: ModelMessage[] }> } = result;
   const wrappedTextStream = async function* () {
     let hasContent = false;
     for await (const delta of result.textStream) {
@@ -406,7 +420,9 @@ export async function generateResponse(
         temperature: env.GROQ_LLM_TEMPERATURE,
         maxOutputTokens: env.GROQ_LLM_MAX_OUTPUT_TOKENS,
         abortSignal: abortController.signal,
+        providerOptions,
       });
+      finalResult = retryResult;
       for await (const delta of retryResult.textStream) {
         yield delta;
       }
@@ -415,7 +431,7 @@ export async function generateResponse(
 
   return {
     textStream: wrappedTextStream(),
-    text: result.text,
+    responseMessages: async () => (await finalResult.response).messages,
     abort: () => abortController.abort(),
   };
 }

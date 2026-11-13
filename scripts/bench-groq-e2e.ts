@@ -1,5 +1,5 @@
 /**
- * Benchmark: Groq whisper-large-v3-turbo (STT) + llama-4-scout (LLM)
+ * Benchmark: Groq whisper-large-v3-turbo (STT) + GROQ_LLM_MODEL (LLM)
  * Full round-trip with real audio + Deepgram TTS
  */
 import "dotenv/config";
@@ -15,13 +15,14 @@ if (!groqKey) {
 const groq = new Groq({ apiKey: groqKey });
 const DG_KEY = process.env.DEEPGRAM_API_KEY!;
 const INPUT_FILE = path.resolve(process.cwd(), "input.mp3");
+const LLM_MODEL = process.env.GROQ_LLM_MODEL || "qwen/qwen3.8-27b";
 
 const SYSTEM_PROMPT = `You are a friendly dental office receptionist. Keep responses brief and natural for a phone call.
 Respond with only spoken words, no markdown. If the caller speaks in Hindi or Hinglish, respond in simple English but acknowledge you understood them.
 Today's date is 2026-04-01.`;
 
 async function main() {
-  console.log("=== Groq E2E: whisper-large-v3-turbo + llama-4-scout + Deepgram TTS ===\n");
+  console.log(`=== Groq E2E: whisper-large-v3-turbo + ${LLM_MODEL} + Deepgram TTS ===\n`);
 
   const audioFile = readFileSync(INPUT_FILE);
 
@@ -57,7 +58,8 @@ async function main() {
     const firstSentence: { text: string; time: number } = { text: "", time: 0 };
 
     const stream = await groq.chat.completions.create({
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
+      model: LLM_MODEL,
+      reasoning_effort: LLM_MODEL.startsWith("qwen/") ? "none" : "low",
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "assistant", content: "Thank you for calling Smile Dental Clinic. How can I help you today?" },
