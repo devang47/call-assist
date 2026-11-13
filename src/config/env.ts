@@ -24,6 +24,25 @@ const envSchema = z.object({
   DEEPGRAM_API_KEY: z.string().min(1),
   DEEPGRAM_TTS_MODEL: z.string().default("aura-2-thalia-en"),
 
+  // Speech-to-text. "flux" = Deepgram Flux streaming with built-in turn detection;
+  // "whisper" = Silero VAD + Groq Whisper batch (the original pipeline).
+  STT_PROVIDER: z.enum(["flux", "whisper"]).default("flux"),
+  DEEPGRAM_STT_MODEL: z.enum(["flux-general-multi", "flux-general-en"]).default("flux-general-multi"),
+  FLUX_LANGUAGE_HINTS: z
+    .string()
+    .default("en,hi")
+    .transform((v) => v.split(",").map((s) => s.trim()).filter(Boolean)),
+  FLUX_EOT_THRESHOLD: z.coerce.number().min(0.5).max(1).default(0.7),
+  // Start the LLM early on a likely end of turn (cancelled if the caller keeps talking).
+  // 0 disables. Costs ~50-70% more LLM calls per Deepgram.
+  FLUX_EAGER_EOT_THRESHOLD: z.coerce.number().min(0).max(0.9).default(0.5),
+  FLUX_EOT_TIMEOUT_MS: z.coerce.number().int().min(500).max(60_000).default(5000),
+
+  // Langfuse tracing of every LLM call (optional; off unless both keys are set).
+  // Traces include transcripts — patient names and phone numbers.
+  LANGFUSE_PUBLIC_KEY: z.string().optional(),
+  LANGFUSE_SECRET_KEY: z.string().optional(),
+
   // Groq (STT + LLM)
   GROQ_API_KEY: z.string().min(1),
   GROQ_STT_MODEL: z.string().default("whisper-large-v3-turbo"),
@@ -31,7 +50,7 @@ const envSchema = z.object({
   // "none" = Qwen instruct mode. gpt-oss needs "low". Empty string = don't send it.
   GROQ_LLM_REASONING_EFFORT: z.enum(["", "none", "low", "medium", "high"]).default("none"),
   GROQ_LLM_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
-  GROQ_LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(80),
+  GROQ_LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(200), // 80 could truncate a book_appointment tool call
   GROQ_LLM_MAX_STEPS: z.coerce.number().int().min(2).max(8).default(4),
 
   // Voice tuning

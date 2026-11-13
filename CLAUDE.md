@@ -6,11 +6,12 @@ AI-powered phone receptionist for dental offices. Handles inbound calls via Twil
 
 - **Runtime**: Node.js / TypeScript with Fastify
 - **Telephony**: Twilio (Media Streams WebSocket + REST API + SMS)
-- **VAD**: Silero VAD via sherpa-onnx-node (local, mulaw 8kHz → float32 16kHz)
-- **STT**: Groq Whisper (`whisper-large-v3-turbo`, batch API, auto language detect)
+- **STT + turn detection**: Deepgram Flux (`flux-general-multi`, `/v2/listen` WebSocket, linear16 8kHz) — default, `STT_PROVIDER=flux`
+- **Fallback STT** (`STT_PROVIDER=whisper`): Silero VAD via sherpa-onnx-node + Groq Whisper `whisper-large-v3-turbo` batch
 - **LLM**: Groq `qwen/qwen3.8-27b` with `reasoning_effort: "none"` (streaming via Vercel AI SDK `@ai-sdk/openai` with Groq base URL)
 - **TTS**: Deepgram Aura-2 (streaming WebSocket, mulaw 8kHz output)
 - **Tool calling**: Vercel AI SDK (`ai` + `@ai-sdk/openai`) with Zod schemas, `stopWhen: stepCountIs(5)`
+- **Observability**: per-turn `turn_latency` events in the call JSONL + `pnpm latency:report`; optional Langfuse (`@langfuse/otel`) via AI SDK `experimental_telemetry`
 - **Database**: SQLite (better-sqlite3) + Drizzle ORM
 - **Scheduling**: Google Calendar API (per-practice OAuth)
 
@@ -25,6 +26,8 @@ pnpm db:generate  # Generate Drizzle migration
 pnpm db:migrate   # Run migrations
 pnpm db:seed      # Seed a practice from .env values
 pnpm db:studio    # Drizzle Kit studio (DB browser)
+pnpm test         # vitest
+pnpm latency:report [date]  # p50/p90/p99 per stage from storage/call-logs
 ```
 
 ## Architecture
@@ -39,7 +42,14 @@ Twilio inbound call
   → start event: read customParameters (practiceId, callerPhone, callLogId)
   → Load PracticeContext, pre-warm TTS, send greeting
 
-Per-frame audio loop:
+Per-frame audio loop (flux, default):
+  Twilio mulaw → linear16 → Deepgram Flux (80ms chunks, always streamed)
+  → StartOfTurn: barge-in if speaking; warm Groq connection
+  → EagerEndOfTurn: start a speculative LLM draft (not spoken, tools gated)
+  → TurnResumed: cancel draft  → EndOfTurn: commit draft if transcript matches, else normal LLM turn
+  → Groq LLM streaming with tools → Clause-level sentence buffer → Deepgram TTS → Twilio playback
+
+Per-frame audio loop (whisper):
   Twilio mulaw audio → Silero VAD (local) → speech boundaries
   → Groq Whisper batch STT (with garbage filter: min 2 words, 4 chars)
   → Speculative prefetch (if scheduling keywords detected, fire check_availability in parallel)
@@ -54,7 +64,9 @@ Per-frame audio loop:
 - **Twilio `<Parameter>` elements**: Custom metadata passed via TwiML `<Stream><Parameter>` tags, received in the WebSocket `start` event's `customParameters`. More reliable than URL query params.
 - **LLM turn queue**: `enqueueLLMTurn()` → `runLLMTurn()`. If LLM is busy, new transcripts are merged and queued. Prevents stale-context concurrent requests.
 - **State machine**: `idle → listening → thinking → speaking`. Interruptions only allowed in `speaking` state. Tool execution happens in `thinking` (`onToolStart` drops back to it) — VAD events during this phase don't abort the response.
-- **Barge-in**: VAD keeps running while `speaking` (`BARGE_IN_ENABLED`). On speech start, `interrupt()` sends Twilio `clear`, calls `tts.clear()`, aborts the LLM, and bumps `speechEpoch` so the running turn stops and saves only its partial text.
+- **Eager end-of-turn drafts** (flux): `enqueueLLMTurn(transcript, ready)` runs `processLLMTurn` with a `ready: Promise<boolean>`. The LLM request goes out immediately but nothing is spoken or added to history until `ready` resolves true on `EndOfTurn`. Every tool `execute` first awaits the same promise (`gate` in `createTools`), so a draft can never book, transfer, or hang up. Flux guarantees `EndOfTurn` repeats the last `EagerEndOfTurn` transcript unless `TurnResumed` came between.
+- **Turn latency**: `turn` holds timestamps for the turn being answered; the first TTS audio byte after it logs `turn_latency` (`TurnLatency` in `src/lib/latency.ts`). End of speech = VAD event minus `VAD_MIN_SILENCE_DURATION_S` (whisper) or Flux's last word end mapped to wall time via `fluxAudioStartAt` (flux). `call_latency_summary` is logged at cleanup.
+- **Barge-in**: Flux `StartOfTurn` (flux) or VAD speech start (whisper) while `speaking` (`BARGE_IN_ENABLED`). On speech start, `interrupt()` sends Twilio `clear`, calls `tts.clear()`, aborts the LLM, and bumps `speechEpoch` so the running turn stops and saves only its partial text.
 - **Conversation history**: After each turn, the AI SDK response messages (assistant tool calls + tool results) are appended, not just the spoken text, so the model remembers offered slots.
 - **TTS queue + audio cache**: `tts.speak(text, { cache })` queues one utterance; audio is emitted in queue order even when an utterance comes from disk. Only fixed phrases (`cache: true`: greeting, hold messages, fallbacks) are cached, keyed by SHA-256 of model + text in `storage/tts-cache/`. LLM output is never cached (it can contain names/phone numbers).
 - **Tool hold messages**: "Let me check that for you" / "One moment while I book that" sent via TTS before tool execution so caller isn't left in silence.
@@ -96,7 +108,8 @@ On `tool_use_failed` (Groq malformed tool call), the system retries once without
 - **STT failure**: Retry once (300ms backoff), then fallback message
 - **Empty LLM response**: Contextual fallback based on call state
 - **tool_use_failed**: Retry without tools to get a plain text response
-- **Garbage STT**: Filtered before LLM (< 2 words, < 4 chars, mostly non-ASCII)
+- **Garbage STT**: Whisper mode only — filtered before LLM (< 2 words, < 4 chars, mostly non-ASCII). Flux doesn't hallucinate on noise, so one-word answers like "yes" are kept.
+- **Flux disconnect**: Reconnect up to 3 times; audio clock resets
 
 ## Project Structure
 
@@ -108,11 +121,17 @@ src/
     index.ts                 # SQLite connection (WAL mode)
     practice-context.ts      # PracticeContext interface + DB loaders + cache
     queries/                 # call-logs.ts, transcripts.ts, patients.ts
+  lib/
+    call-debug-log.ts        # Per-call JSONL event log (storage/call-logs/<date>/<callSid>.jsonl)
+    latency.ts               # TurnLatency record + percentiles
+    telemetry.ts             # Optional Langfuse span processor (OpenTelemetry)
+    time.ts                  # Timezone-aware date helpers
   middleware/
     twilio-signature.ts      # Webhook signature validation (skips WebSocket GETs)
   pipeline/
-    vad.ts                   # Silero VAD (sherpa-onnx-node)
-    stt.ts                   # Groq Whisper batch STT (with retry)
+    flux-stt.ts              # Deepgram Flux streaming STT + turn events (default)
+    vad.ts                   # Silero VAD (sherpa-onnx-node) — whisper mode
+    stt.ts                   # Groq Whisper batch STT (with retry) — whisper mode
     llm.ts                   # Groq LLM + tool definitions + tool_use_failed retry
     tts.ts                   # Deepgram Aura-2 streaming TTS (with cache + reconnect)
     tts-cache.ts             # Disk-based TTS audio cache (SHA-256 → mulaw)
@@ -137,6 +156,7 @@ scripts/
   debug-call.ts              # Fetch Twilio call logs + error notifications
   bench-*-providers.ts       # Per-stage provider benchmarks (STT, LLM, TTS)
   bench-groq-e2e.ts          # Round trip: real audio → STT → LLM → TTS (pnpm bench:e2e)
+  latency-report.ts          # p50/p90/p99 from real calls' turn_latency events
 drizzle/                     # Generated migrations
 storage/tts-cache/           # Cached TTS audio (gitignored)
 data/                        # SQLite DB file (gitignored)
@@ -149,6 +169,8 @@ See `.env.example`. Key ones:
 - `DATABASE_PATH` — SQLite file path (default `./data/call-assist.db`)
 - `TWILIO_SIGNATURE_VALIDATION` — `true`/`false` (set `false` for local dev)
 - `NODE_ENV` — `development` (pino-pretty) or `production` (JSON logs)
+- `STT_PROVIDER` — `flux` (default) or `whisper`; `FLUX_EAGER_EOT_THRESHOLD` — `0` disables speculative drafts
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` — enable Langfuse tracing (traces contain patient PII)
 - `GROQ_LLM_MODEL` — default `qwen/qwen3.8-27b`; `GROQ_LLM_REASONING_EFFORT` — default `none` (use `low` for gpt-oss)
 - Practice config env vars are fallbacks — DB is the primary source
 
@@ -161,4 +183,6 @@ See `.env.example`. Key ones:
 - Qwen 3.x reasons by default — keep `GROQ_LLM_REASONING_EFFORT=none` or TTFT balloons. Groq rejects `reasoning_format: raw` with tools.
 - Tests: `pnpm test` (vitest, `src/**/*.test.ts`).
 - State must be `"thinking"` (not `"speaking"`) during tool execution to prevent VAD interruptions from aborting the response before text arrives.
+- Flux `eager_eot_threshold` must be ≤ `eot_threshold` or Deepgram rejects the connection.
+- `@langfuse/otel` 6.x needs `@opentelemetry/api` < 1.10 and `@opentelemetry/core` 2.x — pinned in package.json; don't bump them independently.
 - `better-sqlite3` requires native build — run `pnpm rebuild better-sqlite3` if bindings are missing.

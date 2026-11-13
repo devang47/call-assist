@@ -9,11 +9,28 @@ import { bookAppointment } from "../scheduling/booking.js";
 import type { PracticeContext } from "../db/practice-context.js";
 import { getCachedAvailability, invalidatePrefetch } from "./prefetch.js";
 import type { CallEventLogger } from "../lib/call-debug-log.js";
+import { telemetryEnabled } from "../lib/telemetry.js";
 
 const groq = createOpenAI({
   apiKey: env.GROQ_API_KEY,
   baseURL: "https://api.groq.com/openai/v1",
 });
+
+let lastWarmUp = 0;
+/**
+ * Node's fetch drops idle sockets after ~4s, so the first LLM request of a turn
+ * usually pays a fresh TLS handshake. Called when the caller starts talking, it
+ * opens a pooled connection that the LLM request then reuses.
+ */
+export function warmUpLLMConnection(): void {
+  if (Date.now() - lastWarmUp < 2000) return;
+  lastWarmUp = Date.now();
+  fetch("https://api.groq.com/openai/v1/models", {
+    headers: { Authorization: `Bearer ${env.GROQ_API_KEY}` },
+  })
+    .then((r) => r.arrayBuffer()) // read fully so the socket goes back to the pool
+    .catch(() => {});
+}
 
 export interface ToolCallbacks {
   onOutcome: (outcome: string, details?: Record<string, unknown>) => void;
@@ -36,8 +53,14 @@ function createTools(
   ctx: PracticeContext,
   callbacks: ToolCallbacks,
   log: FastifyBaseLogger,
-  eventLogger?: CallEventLogger
+  eventLogger?: CallEventLogger,
+  gate?: Promise<boolean>
 ) {
+  // A speculative (eager end-of-turn) draft must not book, transfer, or hang up
+  // before the caller has actually finished speaking. Cancelled drafts never resolve true.
+  const confirmed = async () => {
+    if (gate && !(await gate)) throw new Error("Speculative turn cancelled");
+  };
   const availabilityCalls = new Map<string, number>();
   const availabilityResults = new Map<string, AvailabilityResult>();
   const availabilityInFlight = new Map<string, Promise<AvailabilityResult>>();
@@ -58,6 +81,7 @@ function createTools(
           .describe("Exact time the caller asked about, like '12 p.m.', '2:30 pm', or '14:00'"),
       }),
       execute: async ({ date, service_type, requested_time }) => {
+        await confirmed();
         const requestKey = JSON.stringify({
           date,
           service_type: service_type ?? null,
@@ -144,6 +168,7 @@ function createTools(
         notes: z.string().optional().describe("Any additional notes about the appointment"),
       }),
       execute: async ({ date, time, patient_name, patient_phone, service_type, notes }) => {
+        await confirmed();
         log.info({ tool: "book_appointment", date, time, patient_name, service_type }, "Tool called");
         eventLogger?.logEvent("tool_called", {
           tool: "book_appointment",
@@ -222,6 +247,7 @@ function createTools(
           .describe("What the caller wants to know: hours, address, services, insurance, pricing, parking"),
       }),
       execute: async ({ query }) => {
+        await confirmed();
         log.info({ tool: "get_practice_info", query }, "Tool called");
         eventLogger?.logEvent("tool_called", {
           tool: "get_practice_info",
@@ -262,6 +288,7 @@ function createTools(
         reason: z.string().describe("Brief reason for the transfer"),
       }),
       execute: async ({ reason }) => {
+        await confirmed();
         log.info({ tool: "transfer_to_human", reason }, "Tool called");
         eventLogger?.logEvent("tool_called", {
           tool: "transfer_to_human",
@@ -300,6 +327,7 @@ function createTools(
         reason: z.string().describe("Why the call is ending: 'completed', 'goodbye'"),
       }),
       execute: async ({ reason }) => {
+        await confirmed();
         log.info({ tool: "end_call", reason }, "Tool called");
         callbacks.onEndCall(reason);
         const result = { hangup: true, reason };
@@ -339,7 +367,8 @@ export async function generateResponse(
   ctx: PracticeContext,
   callbacks: ToolCallbacks,
   log: FastifyBaseLogger,
-  eventLogger?: CallEventLogger
+  eventLogger?: CallEventLogger,
+  opts: { gate?: Promise<boolean>; callSid?: string } = {}
 ): Promise<StreamingLLMResponse> {
   const abortController = new AbortController();
 
@@ -347,7 +376,12 @@ export async function generateResponse(
     abortSignal.addEventListener("abort", () => abortController.abort());
   }
 
-  const tools = createTools(ctx, callbacks, log, eventLogger);
+  const tools = createTools(ctx, callbacks, log, eventLogger, opts.gate);
+  const telemetry = {
+    isEnabled: telemetryEnabled,
+    functionId: "voice-turn",
+    metadata: { sessionId: opts.callSid ?? "", practiceId: ctx.id, speculative: Boolean(opts.gate) },
+  };
 
   let hasToolError = false;
   eventLogger?.logEvent("llm_request_started", {
@@ -366,6 +400,7 @@ export async function generateResponse(
     maxOutputTokens: env.GROQ_LLM_MAX_OUTPUT_TOKENS,
     abortSignal: abortController.signal,
     providerOptions,
+    experimental_telemetry: telemetry,
     onStepFinish: (event) => {
       if (event.finishReason === "error") {
         hasToolError = true;
@@ -421,6 +456,7 @@ export async function generateResponse(
         maxOutputTokens: env.GROQ_LLM_MAX_OUTPUT_TOKENS,
         abortSignal: abortController.signal,
         providerOptions,
+        experimental_telemetry: telemetry,
       });
       finalResult = retryResult;
       for await (const delta of retryResult.textStream) {

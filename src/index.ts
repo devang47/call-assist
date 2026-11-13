@@ -1,7 +1,9 @@
 import { env } from "./config/env.js";
 import { buildApp } from "./server/app.js";
+import { initTelemetry } from "./lib/telemetry.js";
 
 async function main() {
+  await initTelemetry();
   const app = await buildApp();
 
   try {

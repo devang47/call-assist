@@ -13,9 +13,16 @@ import { updateCallLog } from "../db/queries/call-logs.js";
 import { appendTranscriptTurn } from "../db/queries/transcripts.js";
 import { SileroVAD } from "../pipeline/vad.js";
 import { GroqSTT } from "../pipeline/stt.js";
+import { FluxSTT, num, type FluxTurnInfo } from "../pipeline/flux-stt.js";
+import { summarize, type TurnLatency } from "../lib/latency.js";
 import { DeepgramTTS } from "../pipeline/tts.js";
 import { SentenceBuffer } from "../pipeline/sentence-buffer.js";
-import { generateResponse, type StreamingLLMResponse, type ToolCallbacks } from "../pipeline/llm.js";
+import {
+  generateResponse,
+  warmUpLLMConnection,
+  type StreamingLLMResponse,
+  type ToolCallbacks,
+} from "../pipeline/llm.js";
 import { sendBookingConfirmationSms } from "../services/sms.js";
 import { maybePrefetchAvailability } from "../pipeline/prefetch.js";
 import type { PipelineState } from "../pipeline/types.js";
@@ -125,8 +132,16 @@ export function handleMediaStream(
   let markCounter = 0;
   let transcriptSeq = 0;
 
-  let turnStart: number | null = null;
-  let ttsFirstByte: number | null = null;
+  /** Timing for the caller turn being answered; cleared once its first audio goes out. */
+  let turn: {
+    speechEndAt: number;
+    detectedAt: number;
+    sttMs?: number;
+    llmTtftMs?: number;
+    speculative: boolean;
+    answerQueued: boolean;
+  } | null = null;
+  const turnLatencies: TurnLatency[] = [];
   let mediaFrameCount = 0;
   let mediaBytes = 0;
   let sessionClosed = false;
@@ -160,8 +175,17 @@ export function handleMediaStream(
   let silenceTimer: ReturnType<typeof setTimeout> | null = null;
   let silencePrompted = false;
 
-  const vad = new SileroVAD();
+  const useFlux = env.STT_PROVIDER === "flux";
+  // Flux does its own turn detection, so the local VAD only runs in whisper mode.
+  const vad = useFlux ? null : new SileroVAD();
   const stt = new GroqSTT();
+  const flux = useFlux ? new FluxSTT() : null;
+  /** performance.now() of the first frame sent to Flux = Flux audio time 0. */
+  let fluxAudioStartAt: number | null = null;
+  /** Current Flux turn began while we couldn't take it (thinking, or speaking without barge-in). */
+  let fluxTurnIgnored = true;
+  /** LLM draft started on EagerEndOfTurn; settle(true) commits it, settle(false) discards it. */
+  let draft: { transcript: string; settle: (commit: boolean) => void } | null = null;
   const tts = new DeepgramTTS();
   const twilioClient = Twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
 
@@ -308,6 +332,7 @@ export function handleMediaStream(
     pendingPlaybackFlushes = 0;
     pendingMarks.clear();
     advanceOnPlaybackDrain = false;
+    turn = null;
     // They have more to say, so don't hang up after the cut-off goodbye.
     pendingHangup = false;
     state = "listening";
@@ -498,10 +523,11 @@ export function handleMediaStream(
     }
   }
 
-  vad.on("speechStart", () => {
+  vad?.on("speechStart", () => {
     if (sessionClosed) return;
     if (state === "speaking") interrupt();
     if (state !== "listening") return;
+    warmUpLLMConnection();
     if (silenceTimer) clearTimeout(silenceTimer);
     logCallEvent("speech_started", { state });
     startSpeechCapture(true);
@@ -509,10 +535,16 @@ export function handleMediaStream(
     logCallEvent("state_changed", { state });
   });
 
-  vad.on("speechEnd", async (durationSecs: number) => {
+  vad?.on("speechEnd", async (durationSecs: number) => {
     if (sessionClosed) return;
-    turnStart = performance.now();
-    ttsFirstByte = null;
+    // The VAD only fires after VAD_MIN_SILENCE_DURATION_S of silence; the caller stopped before that.
+    const detectedAt = performance.now();
+    turn = {
+      speechEndAt: detectedAt - env.VAD_MIN_SILENCE_DURATION_S * 1000,
+      detectedAt,
+      speculative: false,
+      answerQueued: false,
+    };
     capturingSpeech = false;
     const bufferedAudioDurationS = stt.getBufferDuration();
     clearPreSpeechBuffer();
@@ -523,6 +555,7 @@ export function handleMediaStream(
     });
 
     if (bufferedAudioDurationS < 0.5) {
+      turn = null;
       resetSttCapture();
       state = "listening";
       logCallEvent("short_audio_discarded", {
@@ -544,12 +577,14 @@ export function handleMediaStream(
       });
       const transcript = await stt.transcribe();
       const sttMs = performance.now() - sttStart;
+      if (turn) turn.sttMs = Math.round(sttMs);
 
       if (sessionClosed) {
         return;
       }
 
       if (!transcript) {
+        turn = null;
         log.info({ sttMs: +sttMs.toFixed(0) }, "Empty transcript");
         logCallEvent("stt_empty", { sttMs: +sttMs.toFixed(0) });
         state = "listening";
@@ -560,6 +595,7 @@ export function handleMediaStream(
 
       // Filter garbage transcripts
       if (isGarbageTranscript(transcript)) {
+        turn = null;
         log.info({ transcript, sttMs: +sttMs.toFixed(0) }, "Garbage transcript filtered");
         logCallEvent("stt_garbage_filtered", {
           transcript,
@@ -590,6 +626,7 @@ export function handleMediaStream(
     } catch (err) {
       log.error({ err }, "STT failed");
       logCallEvent("stt_failed", getErrorDetails(err));
+      turn = null;
       queueSpeech("I'm sorry, I didn't catch that. Could you please repeat?", true);
       state = "speaking";
       logCallEvent("state_changed", { state });
@@ -597,14 +634,119 @@ export function handleMediaStream(
     }
   });
 
+  function cancelDraft(reason: string) {
+    if (!draft) return;
+    logCallEvent("eager_draft_cancelled", { reason, transcript: draft.transcript });
+    draft.settle(false);
+    draft = null;
+  }
+
+  flux?.on("turn", (t: FluxTurnInfo) => {
+    if (sessionClosed) return;
+    const transcript = t.transcript.trim();
+
+    switch (t.event) {
+      case "StartOfTurn":
+        // Deepgram's recommended barge-in signal: it always carries real words.
+        if (state === "speaking" && env.BARGE_IN_ENABLED) interrupt();
+        fluxTurnIgnored = state !== "listening";
+        logCallEvent("speech_started", { state, ignored: fluxTurnIgnored });
+        if (fluxTurnIgnored) return;
+        if (silenceTimer) clearTimeout(silenceTimer);
+        warmUpLLMConnection();
+        return;
+
+      case "EagerEndOfTurn": {
+        // Probably done talking: start the LLM now, speak only if EndOfTurn confirms.
+        if (fluxTurnIgnored || llmBusy || !transcript || !ctx) return;
+        cancelDraft("superseded");
+        maybePrefetchAvailability(transcript, ctx);
+        let settle!: (commit: boolean) => void;
+        const ready = new Promise<boolean>((resolve) => (settle = resolve));
+        draft = { transcript, settle };
+        logCallEvent("eager_draft_started", { transcript });
+        enqueueLLMTurn(transcript, ready);
+        return;
+      }
+
+      case "TurnResumed":
+        cancelDraft("turn_resumed");
+        return;
+
+      case "EndOfTurn": {
+        if (fluxTurnIgnored) {
+          cancelDraft("turn_ignored");
+          return;
+        }
+        fluxTurnIgnored = true; // until the next StartOfTurn
+
+        const detectedAt = performance.now();
+        const lastWordEnd = num(t.words?.at(-1)?.end) ?? num(t.audio_window_end);
+        const speechEndAt =
+          lastWordEnd !== undefined && fluxAudioStartAt !== null
+            ? Math.min(detectedAt, fluxAudioStartAt + lastWordEnd * 1000)
+            : detectedAt;
+        log.info({ transcript, trigger: t.trigger }, "STT complete");
+        logCallEvent("stt_completed", {
+          transcript,
+          trigger: t.trigger,
+          endpointMs: Math.round(detectedAt - speechEndAt),
+        });
+
+        // Unlike Whisper, Flux doesn't hallucinate on noise, so a one-word "yes" is kept.
+        if (!transcript || !ctx) {
+          cancelDraft("empty_transcript");
+          resetSilenceTimer();
+          return;
+        }
+
+        turn = { speechEndAt, detectedAt, speculative: false, answerQueued: false };
+        state = "thinking";
+        logCallEvent("state_changed", { state });
+
+        // Flux guarantees EndOfTurn repeats the last EagerEndOfTurn transcript unless TurnResumed came between.
+        if (draft?.transcript === transcript) {
+          turn.speculative = true;
+          logCallEvent("eager_draft_committed", { transcript });
+          draft.settle(true);
+          draft = null;
+          return;
+        }
+        cancelDraft("transcript_changed");
+        maybePrefetchAvailability(transcript, ctx);
+        enqueueLLMTurn(transcript);
+        return;
+      }
+    }
+  });
+
+  flux?.on("error", (err: Error) => {
+    log.error({ err }, "Flux STT error");
+    logCallEvent("stt_failed", getErrorDetails(err));
+  });
+
+  flux?.on("reconnecting", (attempt: number) => {
+    log.warn({ attempt }, "Flux STT disconnected — reconnecting");
+    logCallEvent("stt_reconnecting", { attempt });
+    fluxAudioStartAt = null; // new socket, new audio clock
+  });
+
   tts.on("audio", (base64Audio: string) => {
-    if (turnStart && !ttsFirstByte) {
-      ttsFirstByte = performance.now();
-      const perceivedMs = ttsFirstByte - turnStart;
-      log.info({ perceivedMs: +perceivedMs.toFixed(0) }, "First audio byte (perceived latency)");
-      logCallEvent("tts_first_audio_byte", {
-        perceivedMs: +perceivedMs.toFixed(0),
-      });
+    if (turn) {
+      const now = performance.now();
+      const latency: TurnLatency = {
+        stt: useFlux ? "flux" : "whisper",
+        endpointMs: Math.round(turn.detectedAt - turn.speechEndAt),
+        sttMs: turn.sttMs,
+        llmTtftMs: turn.llmTtftMs,
+        totalMs: Math.round(now - turn.speechEndAt),
+        speculative: turn.speculative,
+        holdMessage: !turn.answerQueued,
+      };
+      turn = null;
+      turnLatencies.push(latency);
+      log.info(latency, "Turn latency (end of speech → first audio)");
+      logCallEvent("turn_latency", latency as unknown as Record<string, unknown>);
     }
 
     if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
@@ -665,11 +807,12 @@ export function handleMediaStream(
       case "connected":
         log.info("Twilio stream connected");
         logCallEvent("twilio_stream_connected");
-        // Open the TTS socket before the start event arrives
+        // Open the TTS and STT sockets before the start event arrives
         tts.start().catch((err) => {
           log.error({ err }, "TTS pre-warm failed");
           logCallEvent("tts_prewarm_failed", getErrorDetails(err));
         });
+        flux?.start();
         break;
 
       case "start": {
@@ -706,13 +849,20 @@ export function handleMediaStream(
           mediaFrameCount++;
           mediaBytes += audioBuffer.length;
           if (sessionClosed) break;
+          if (flux) {
+            // Always stream: Flux needs continuous audio for turn detection and
+            // its clock must track wall time for the latency numbers.
+            fluxAudioStartAt ??= performance.now();
+            flux.sendMulaw(audioBuffer);
+            break;
+          }
           // While speaking, keep listening so the caller can interrupt.
           const canHear = state === "listening" || (state === "speaking" && env.BARGE_IN_ENABLED);
           if (!canHear) {
             resetSttCapture();
             break;
           }
-          vad.processFrame(audioBuffer);
+          vad!.processFrame(audioBuffer);
           if (capturingSpeech) {
             stt.appendAudio(audioBuffer);
           } else {
@@ -751,7 +901,8 @@ export function handleMediaStream(
   });
 
   /** Enqueue an LLM turn — if one is already running, queue it for after. */
-  function enqueueLLMTurn(utterance: string) {
+  /** `ready` marks a speculative draft: resolves true to speak it, false to drop it. */
+  function enqueueLLMTurn(utterance: string, ready?: Promise<boolean>) {
     if (sessionClosed) return;
     if (llmBusy) {
       // Merge with pending utterance if one exists
@@ -768,13 +919,13 @@ export function handleMediaStream(
       }
       return;
     }
-    logCallEvent("llm_turn_started", { utterance });
-    runLLMTurn(utterance);
+    logCallEvent("llm_turn_started", { utterance, speculative: Boolean(ready) });
+    runLLMTurn(utterance, ready);
   }
 
-  async function runLLMTurn(utterance: string) {
+  async function runLLMTurn(utterance: string, ready?: Promise<boolean>) {
     llmBusy = true;
-    await processLLMTurn(utterance);
+    await processLLMTurn(utterance, ready);
     llmBusy = false;
 
     // Process queued utterance if any
@@ -787,29 +938,37 @@ export function handleMediaStream(
     }
   }
 
-  async function processLLMTurn(userUtterance: string) {
+  async function processLLMTurn(userUtterance: string, ready?: Promise<boolean>) {
     if (sessionClosed) return;
     if (!userUtterance.trim() || !ctx) return;
 
-    holdMessageSent = false;
-    conversationHistory.push({ role: "user", content: userUtterance });
-    logTranscript("user", userUtterance);
+    const userMessage: ModelMessage = { role: "user", content: userUtterance };
 
     try {
-      const llmStart = performance.now();
+      let llmStart = performance.now();
       const abortController = new AbortController();
       const response = await generateResponse(
-        conversationHistory,
+        [...conversationHistory, userMessage],
         abortController.signal,
         ctx,
         toolCallbacks,
         log,
-        callDebugLogger ?? undefined
+        callDebugLogger ?? undefined,
+        { gate: ready, callSid: callSid ?? undefined }
       );
+      // Speculative draft: the request is already in flight; wait for Flux to confirm the turn.
+      if (ready && !(await ready)) {
+        abortController.abort();
+        return;
+      }
       if (sessionClosed) {
         abortController.abort();
         return;
       }
+      if (ready) llmStart = performance.now();
+      holdMessageSent = false;
+      conversationHistory.push(userMessage);
+      logTranscript("user", userUtterance);
       currentResponse = response;
       logCallEvent("llm_generation_started", {
         utterance: userUtterance,
@@ -820,6 +979,7 @@ export function handleMediaStream(
       const sentenceBuffer = new SentenceBuffer((sentence) => {
         const spokenSentence = sanitizeSpokenText(sentence);
         if (!spokenSentence) return;
+        if (turn) turn.answerQueued = true;
         if (!firstSentenceTime) {
           firstSentenceTime = performance.now() - llmStart;
           log.info({ firstSentenceMs: +firstSentenceTime.toFixed(0) }, "LLM first sentence sent to TTS");
@@ -842,6 +1002,7 @@ export function handleMediaStream(
             const ttft = performance.now() - llmStart;
             log.info({ ttftMs: +ttft.toFixed(0) }, "LLM first token");
             logCallEvent("llm_first_token", { ttftMs: +ttft.toFixed(0) });
+            if (turn) turn.llmTtftMs = Math.round(performance.now() - turn.detectedAt);
             firstToken = false;
           }
           // Also re-entered after a tool call put us back in "thinking".
@@ -953,15 +1114,23 @@ export function handleMediaStream(
     pendingMarks.clear();
     pendingPlaybackFlushes = 0;
     advanceOnPlaybackDrain = false;
+    cancelDraft("session_closed");
     resetSttCapture();
-    vad.reset();
-    vad.removeAllListeners();
+    vad?.reset();
+    vad?.removeAllListeners();
+    flux?.close();
+    flux?.removeAllListeners();
     tts.close();
     logCallEvent("media_stream_summary", {
       mediaFrameCount,
       mediaBytes,
       turns: conversationHistory.length,
     });
+    if (turnLatencies.length > 0) {
+      const latencySummary = summarize(turnLatencies.map((l) => l.totalMs));
+      log.info(latencySummary, "Call latency (end of speech → first audio, ms)");
+      logCallEvent("call_latency_summary", latencySummary);
+    }
 
     if (callSid) {
       try {
