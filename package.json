@@ -35,7 +35,7 @@
     "@fastify/websocket": "^11.2.0",
     "@langfuse/otel": "^6.1.1",
     "@opentelemetry/api": "~1.9.0",
-    "@opentelemetry/core": "^2.12.1",
+    "@opentelemetry/core": "^2.12.0",
     "@opentelemetry/sdk-trace-node": "^2.12.0",
     "ai": "^6.0.141",
     "alawmulaw": "^6.0.0",

@@ -1,3 +1,16 @@
 onlyBuiltDependencies:
   - better-sqlite3
   - esbuild
+# Keep the OpenTelemetry tree on releases at least two weeks old, so offline
+# npm mirrors that lag the registry can still install from this lockfile.
+overrides:
+  "@opentelemetry/core": 2.12.0
+  "@opentelemetry/resources": 2.12.0
+  "@opentelemetry/sdk-trace": 2.12.0
+  "@opentelemetry/sdk-metrics": 2.12.0
+  "@opentelemetry/api-logs": 0.223.0
+  "@opentelemetry/sdk-logs": 0.223.0
+  "@opentelemetry/otlp-transformer": 0.223.0
+  "@opentelemetry/otlp-exporter-base": 0.223.0
+  "@opentelemetry/exporter-trace-otlp-http": 0.223.0
+  "@opentelemetry/semantic-conventions": 1.44.0
