@@ -1,3 +1,7 @@
+# Build native modules (better-sqlite3) against the local Node headers,
+# so an install never has to download headers.
+nodedir: /usr/local
+
 onlyBuiltDependencies:
   - better-sqlite3
   - esbuild
